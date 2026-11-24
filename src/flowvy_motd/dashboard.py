@@ -138,13 +138,17 @@ def render_dashboard(config, metrics, network, components, probes, *, width=80, 
             return
         used, total = value
         figures = f'{format_bytes(used)} / {format_bytes(total)}'
-        if not compact and total:
-            length = min(12, max(0, round(12 * used / total)))
-            pad = ' ' * (key_width - len(label))
-            graphical = tint('█' * length, 'ok') + tint('░' * (12 - length), 'muted')
-            lines.append(tint(label + pad, 'accent') + separator + graphical + '  ' + figures)
-        else:
+        if key == 'swap' and not total:
+            figures = 'Disabled'
+        if compact:
             row(label, figures)
+            return
+        scale_width = 12
+        scale = ' ' * scale_width
+        if total:
+            length = min(scale_width, max(0, round(scale_width * used / total)))
+            scale = tint('━' * length, 'ok') + tint('─' * (scale_width - length), 'muted')
+        lines.append(tint(label.ljust(key_width), 'accent') + separator + scale + '  ' + figures)
 
     if not compact:
         lines.extend(tint(line, 'accent') for line in LOGO.splitlines())

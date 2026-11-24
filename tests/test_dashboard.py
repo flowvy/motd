@@ -52,6 +52,24 @@ class DashboardTests(unittest.TestCase):
         tone, status, _ = app_status({**self.app, 'primary': '', 'check_url': ''}, self.components, None)
         self.assertEqual((tone, status), ('warn', '1 issue in 2 components'))
 
+    def test_resource_bars_use_thin_lines_and_aligned_values(self):
+        gib = 1024 ** 3
+        metrics = {'memory': (gib, 4 * gib), 'swap': (0, 2 * gib), 'disk': (2 * gib, 4 * gib)}
+        text = render_dashboard({}, metrics, {}, {}, {}, width=80, color=False)
+        rows = dict(line.split(' │ ', 1) for line in text.splitlines() if ' │ ' in line)
+        self.assertEqual({label.strip(): value for label, value in rows.items()}, {
+            'RAM': '━━━─────────  1.0 GiB / 4.0 GiB',
+            'Swap': '────────────  0 MiB / 2.0 GiB',
+            'Disk': '━━━━━━──────  2.0 GiB / 4.0 GiB',
+        })
+
+    def test_disabled_swap_preserves_the_resource_value_column(self):
+        gib = 1024 ** 3
+        text = render_dashboard({}, {'memory': (gib, 4 * gib), 'swap': (0, 0)}, {}, {}, {}, color=False)
+        ram, swap = [line for line in text.splitlines() if line.startswith(('RAM', 'Swap'))]
+        self.assertIn('Disabled', swap)
+        self.assertEqual(swap.index('Disabled'), ram.index('1.0 GiB'))
+
     def test_small_terminal_is_plain_and_does_not_wrap(self):
         settings = {'provider': 'Example', 'role': '', 'location': '', 'services': [],
                     'containers': [], 'applications': [], 'compact': False}
