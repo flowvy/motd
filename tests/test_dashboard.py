@@ -52,15 +52,17 @@ class DashboardTests(unittest.TestCase):
         tone, status, _ = app_status({**self.app, 'primary': '', 'check_url': ''}, self.components, None)
         self.assertEqual((tone, status), ('warn', '1 issue in 2 components'))
 
-    def test_resource_bars_have_equal_side_padding_and_aligned_values(self):
+    def test_resource_bars_start_in_the_same_column_as_load(self):
         gib = 1024 ** 3
-        metrics = {'memory': (gib, 4 * gib), 'swap': (0, 2 * gib), 'disk': (2 * gib, 4 * gib)}
+        metrics = {'load': '0.00 / 0.00 / 0.00', 'memory': (gib, 4 * gib),
+                   'swap': (0, 2 * gib), 'disk': (2 * gib, 4 * gib)}
         text = render_dashboard({}, metrics, {}, {}, {}, width=80, color=False)
         rows = dict(line.split('│', 1) for line in text.splitlines() if '│' in line)
         self.assertEqual({label.strip(): value for label, value in rows.items()}, {
-            'RAM': '  −−−·········  1.0 GiB / 4.0 GiB',
-            'Swap': '  ············  0 MiB / 2.0 GiB',
-            'Disk': '  −−−−−−······  2.0 GiB / 4.0 GiB',
+            'Load': ' 0.00 / 0.00 / 0.00',
+            'RAM': ' −−−·········  1.0 GiB / 4.0 GiB',
+            'Swap': ' ············  0 MiB / 2.0 GiB',
+            'Disk': ' −−−−−−······  2.0 GiB / 4.0 GiB',
         })
 
     def test_colored_resource_bar_uses_bold_ticks_for_usage(self):
@@ -69,7 +71,7 @@ class DashboardTests(unittest.TestCase):
         ram = next(line for line in text.splitlines() if 'RAM' in line)
         self.assertEqual(
             ram.split('│', 1)[1],
-            f'  {COLORS["accent"]}−−−{RESET}{COLORS["muted"]}−−−−−−−−−{RESET}  1.0 GiB / 4.0 GiB',
+            f' {COLORS["accent"]}−−−{RESET}{COLORS["muted"]}−−−−−−−−−{RESET}  1.0 GiB / 4.0 GiB',
         )
 
     def test_disabled_swap_preserves_the_resource_value_column(self):

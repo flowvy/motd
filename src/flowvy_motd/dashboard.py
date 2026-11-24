@@ -150,7 +150,7 @@ def render_dashboard(config, metrics, network, components, probes, *, width=80, 
             stroke = '−'
             track = stroke if color else '·'
             scale = tint(stroke * length, 'accent') + tint(track * (scale_width - length), 'muted')
-        lines.append(f"{tint(label.ljust(key_width), 'accent')}{separator} {scale}  {figures}")
+        lines.append(f"{tint(label.ljust(key_width), 'accent')}{separator}{scale}  {figures}")
 
     if not compact:
         lines.extend(tint(line, 'accent') for line in LOGO.splitlines())

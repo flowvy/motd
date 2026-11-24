@@ -5,7 +5,7 @@ A terminal dashboard for interactive Bash SSH sessions on Debian 13. It shows ho
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/flowvy/motd/v0.1.7/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/flowvy/motd/v0.1.8/install.sh | sh
 ```
 
 The installer requires Python 3.11 or newer. It downloads the latest stable GitHub release and checks its SHA-256 checksum before installing the executable. It uses `sudo` when run by a regular account, or installs directly when run as root. The SSH greeting is initially off. Existing Fastfetch installations provide additional CPU metrics. Docker and NetBird are optional.
