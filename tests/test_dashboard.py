@@ -37,6 +37,17 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual((tone, status), ('bad', 'Unavailable'))
         self.assertIn('HTTP 503', details)
 
+    def test_group_displays_the_selected_service_state_as_its_status(self):
+        self.components['unit:web-update.service'] = Component(
+            'unit:web-update.service', 'Update', state='waiting', schedule='scheduled')
+        tone, status, _ = app_status(self.app, self.components, None)
+        self.assertEqual((tone, status), ('ok', 'Running'))
+
+        self.components['unit:web.service'] = Component('unit:web.service', 'Web', state='failed', detail='exit-code')
+        tone, status, details = app_status(self.app, self.components, None)
+        self.assertEqual((tone, status), ('bad', 'Failed'))
+        self.assertIn('Web · exit-code', details)
+
     def test_unverified_groups_summarize_observed_issues(self):
         tone, status, _ = app_status({**self.app, 'primary': '', 'check_url': ''}, self.components, None)
         self.assertEqual((tone, status), ('warn', '1 issue in 2 components'))

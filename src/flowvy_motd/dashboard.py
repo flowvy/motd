@@ -52,7 +52,7 @@ def app_status(app, components, probe):
     primary = components.get(app['primary'])
     if primary and primary.state in PROBLEM_STATES:
         tone = 'bad' if primary.state in {'failed', 'stopped', 'missing'} else 'warn'
-        return tone, f'Primary component {describe(primary)[1].lower()}', details
+        return tone, describe(primary)[1], details
     if probe and probe[0] == 'unknown':
         return 'warn', 'Availability not checked', details
     if issues:
@@ -63,7 +63,7 @@ def app_status(app, components, probe):
         return 'warn', 'Some components not checked', details
     if primary:
         _, state = describe(primary)
-        return ('ok' if primary.state in {'running', 'healthy'} else 'muted'), f'Primary: {state.lower()}', details
+        return ('ok' if primary.state in {'running', 'healthy'} else 'muted'), state, details
     running = sum(component.state in {'running', 'healthy'} for component in members)
     if running == len(members) and running:
         label = 'component' if running == 1 else 'components'
