@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 from . import __version__, inventory, lifecycle, tui
-from .dashboard import render_dashboard
+from .dashboard import COLORS, RESET, render_dashboard
 from .settings import MAX_BYTES, SettingsError, load, normalize, read_legacy, read_snapshot, save
 from .snapshot import snapshot
 
@@ -74,34 +74,51 @@ def admin_action(arguments, payload=None):
     return message
 
 
-def diagnostic():
-    lines = [f'Flowvy MOTD {__version__}', f'Executable: {lifecycle.BIN}',
-             f'Configuration: {lifecycle.CONFIG}',
-             f'SSH greeting: {lifecycle.hook_status().capitalize()}']
+def _diagnostic_sections():
+    installation = [f'Flowvy MOTD {__version__}', f'Executable: {lifecycle.BIN}',
+                    f'Configuration: {lifecycle.CONFIG}',
+                    f'SSH greeting: {lifecycle.hook_status().capitalize()}']
+    selection = []
+    issues = []
     try:
         config = load(lifecycle.CONFIG)
-        lines.append('Settings: valid' if lifecycle.CONFIG.exists() else 'Settings: using defaults')
-        lines.append(f'Selected services: {len(config["services"])}')
-        lines.append(f'Selected containers: {len(config["containers"])}')
-        lines.append(f'Application groups: {len(config["applications"])}')
+        installation.append('Settings: valid' if lifecycle.CONFIG.exists() else 'Settings: using defaults')
+        selection.extend([
+            f'Selected services: {len(config["services"])}',
+            f'Selected containers: {len(config["containers"])}',
+            f'Application groups: {len(config["applications"])}',
+        ])
         ids = [f'unit:{unit}' for unit in config['services']] + config['containers']
         ids.extend(member for group in config['applications'] for member in group['members'])
         for component in inventory.collect(list(dict.fromkeys(ids)), timeout=2.0).values():
             if component.state in {'unavailable', 'missing', 'failed', 'unknown'}:
-                lines.append(f'{component.name}: {component.detail or component.state}')
+                issues.append(f'{component.name}: {component.detail or component.state}')
     except SettingsError as error:
-        lines.append(f'Settings: {error}')
-    lines.extend(f'{name}: {shutil.which(name) or "not found"}'
-                 for name in ('systemctl', 'fastfetch', 'ip', 'docker', 'netbird'))
-    return '\n'.join(lines)
+        installation.append(f'Settings: {error}')
+    tools = [f'{name}: {shutil.which(name) or "not found"}'
+             for name in ('systemctl', 'fastfetch', 'ip', 'docker', 'netbird')]
+    return [('Installation', installation), ('Selection', selection), ('Issues', issues), ('Tools', tools)]
+
+
+def diagnostic():
+    return '\n'.join(line for _, lines in _diagnostic_sections() for line in lines)
+
+
+def _diagnostic_view():
+    blocks = []
+    for title, lines in _diagnostic_sections():
+        if lines:
+            header = COLORS['accent'] + title + RESET
+            blocks.append('\n'.join([header, *(f'  {line}' for line in lines)]))
+    return '\n\n'.join(blocks)
 
 
 def preview_prompt(draft):
     size = terminal_width()
     metrics, network, components, probes = snapshot(normalize(draft))
-    # The terminal menu supplies its own rendering attributes.
+    plain = not sys.stdout.isatty() or os.environ.get('TERM') == 'dumb'
     return render_dashboard(draft, metrics, network, components, probes,
-                            width=max(20, size - 4), color=False)
+                            width=tui._content_width(size), plain=plain, color=not plain)
 
 
 def configure(source=None):
@@ -111,7 +128,7 @@ def configure(source=None):
     draft = tui.edit_config(config, inventory.discover(), preview_prompt)
     if draft is not None:
         data = json.dumps(normalize(draft), ensure_ascii=False)
-        tui.show_text('Flowvy MOTD', admin_action(['save', revision], data))
+        tui.show_text('Configuration', admin_action(['save', revision], data))
 
 
 def version_key(version):
@@ -144,13 +161,12 @@ def menu():
             ('doctor', 'Diagnostics'),
             ('uninstall', 'Uninstall Flowvy MOTD'),
             ('exit', 'Exit'),
-        ], title=f'Flowvy MOTD {__version__}', subtitle=f'SSH greeting {hook}')
+        ], title='Main menu', subtitle=f'SSH greeting {hook}  ·  Version {__version__}')
         try:
             if action in (None, 'exit'):
                 return
             if action == 'show':
-                print(show(load(lifecycle.CONFIG)), end='', flush=True)
-                input('\nPress Enter to return to the menu. ')
+                tui.show_text('MOTD', preview_prompt(load(lifecycle.CONFIG)))
             elif action == 'configure':
                 configure()
             elif action == 'hook':
@@ -165,14 +181,14 @@ def menu():
             elif action == 'update' and update_menu():
                 return
             elif action == 'doctor':
-                tui.show_text('Diagnostics', diagnostic())
+                tui.show_text('Diagnostics', _diagnostic_view())
             elif action == 'uninstall':
                 keep_config = tui.confirm_uninstall([str(path) for path in (lifecycle.BIN, lifecycle.HOOK, lifecycle.CONFIG)])
                 if keep_config is not None:
                     tui.show_text('Uninstall', admin_action(['uninstall', 'keep' if keep_config else 'remove']))
                     return
         except (OSError, ValueError) as error:
-            tui.show_text('Flowvy MOTD', str(error))
+            tui.show_text('Action failed', str(error))
 
 
 def main():

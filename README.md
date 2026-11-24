@@ -5,20 +5,22 @@ A terminal dashboard for interactive Bash SSH sessions on Debian 13. It shows ho
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/flowvy/motd/v0.1.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/flowvy/motd/v0.1.2/install.sh | sh
 ```
 
 The installer requires Python 3.11 or newer. It downloads the latest stable GitHub release and checks its SHA-256 checksum before installing the executable. It uses `sudo` when run by a regular account, or installs directly when run as root. The SSH greeting is initially off. Existing Fastfetch installations provide additional CPU metrics. Docker and NetBird are optional.
 
 Run `flowvy-motd` to open the English menu. Select **Configure appearance and services**, preview your choices, and then select **Enable SSH greeting**. The greeting applies to interactive Bash SSH logins. The menu also opens the dashboard on demand, checks for releases, displays diagnostics, and handles removal.
 
-If **Location** is blank when you open configuration, Flowvy detects the location of the server’s public outbound IP through [ipwho.is](https://ipwhois.io/documentation). The lookup runs in the background. You can keep, edit, or clear the result before applying settings. A saved location takes precedence. The SSH greeting reads the saved value locally.
+Open **Host details** to edit the provider, server role, and location. Type in the focused field, use **Tab** or **Shift+Tab** to move, and press **Enter** to keep the edits in the draft or **Esc** to discard them.
+
+If **Location** is blank when you open configuration, Flowvy detects the location of the server’s public outbound IP through [ipwho.is](https://ipwhois.io/documentation). The lookup runs in the background, and **Host details** shows the result under the location field. You can keep, edit, or clear it before applying settings. A saved location takes precedence. The SSH greeting reads the saved value locally.
 
 ## Select what appears
 
-In the picker, **Tab** switches between services and containers, **/** searches across both, and **Space** toggles a selection. Search matches the systemd name, description, and Debian package when available, or the container name, image, and Compose project. Compose selections use the project and service labels, so they survive container replacement.
+Open **Service groups** to create a group, name it, and choose its services in one flow. **Containers** has its own picker. In either list, press **/** to filter in place, **Space** to toggle an item, and **Enter** to keep the selection in the draft. Search matches service names, descriptions, and known Debian packages, or container names, images, and Compose projects. Compose selections use the project and service labels, so they survive container replacement.
 
-Application groups combine chosen components into a row. You can nominate a primary component and optionally check a local HTTP endpoint, such as `http://127.0.0.1:8080/health`. A passing application check and a failed helper produce a warning. Without a functional check, the dashboard reports observed component states. Idle scheduled services and completed one-shot jobs are treated separately from failures. The dashboard reads a snapshot on demand and retains no log or status history of its own.
+Groups combine chosen services into a row. You can nominate a primary service and optionally check a local HTTP endpoint, such as `http://127.0.0.1:8080/health`. A passing application check and a failed helper produce a warning. Without a functional check, the dashboard reports observed component states. Idle scheduled services and completed one-shot jobs are treated separately from failures. The dashboard reads a snapshot on demand and retains no log or status history of its own.
 
 ## Update, disable, or uninstall
 

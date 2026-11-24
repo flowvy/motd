@@ -1,33 +1,51 @@
 """Interactive terminal screens for Flowvy MOTD."""
 
+from collections import Counter
 from collections.abc import Callable, Iterable
 from copy import deepcopy
 import curses
+from dataclasses import dataclass
 import os
 import re
+import shutil
+import socket
 import sys
 import textwrap
 from typing import TYPE_CHECKING
 
-from .dashboard import char_width
+from .dashboard import COLORS, RESET, STATUS, char_width, fit
+from .settings import SettingsError, config_text, probe_target
 
 if TYPE_CHECKING:
     from .inventory import Component
 
 
-Row = tuple[str, str]
+@dataclass(frozen=True)
+class _Entry:
+    label: str
+    value: str = ""
+    tone: str = "muted"
+    group: str = ""
+    value_column: int = 0
+
+
+Row = tuple[str | _Entry | list[tuple[str, str]], str]
+Shortcuts = tuple[tuple[str, str], ...]
 Option = tuple[str, str]
 _ENTER = ("\n", "\r", curses.KEY_ENTER)
 _BACKSPACE = ("\b", "\x7f", curses.KEY_BACKSPACE)
-_SOURCES = ("systemd", "docker")
 _GROUP_KIND = {"package": "package", "compose": "Compose"}
 _CONFIG_FIELDS = {"provider": "Provider", "role": "Server role", "location": "Location"}
+_GROUP_FIELDS = {"name": "Group name", "check_url": "Local HTTP check"}
+_FIELD_LIMITS = {"name": 64, "check_url": 300}
 _LOCATION_NOTES = {
     "pending": "Detecting location…",
-    "detected": "Auto-detected from this server’s public IP",
+    "detected": "Auto-detected from this server’s public IP.",
     "unavailable": "Could not detect location. Enter it manually.",
 }
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+_BODY_TOKENS = re.compile(f"{_ANSI.pattern}|[^\x1b]+|\x1b")
+_BODY_TONES = {escape: tone for tone, escape in COLORS.items()} | {RESET: "plain"}
 _STATE_LABELS = {
     "running": "Running",
     "healthy": "Healthy",
@@ -48,9 +66,124 @@ def _text(value):
     return "".join(c for c in str(value) if c.isprintable())
 
 
+def _identifier(text, width):
+    if width < 3 or sum(map(char_width, text)) <= width:
+        return fit(text, width)
+    tail = []
+    used = 0
+    for char in reversed(text):
+        size = char_width(char)
+        if used + size > width // 2:
+            break
+        tail.append(char)
+        used += size
+    return fit(text, width - used) + "".join(reversed(tail))
+
+
+_MENU_KEYS = (("↑ ↓", "Move"), ("Enter", "Select"), ("Esc", "Back"))
+_EDIT_KEYS = (("← →", "Cursor"), ("Ctrl-U", "Clear"), ("Enter", "Apply"), ("Esc", "Revert"))
+_HOST_KEYS = (("Tab", "Next field"), ("Shift-Tab", "Previous"), ("Enter", "Keep changes"), ("Esc", "Cancel"))
+_PICKER_KEYS = (("↑ ↓", "Move"), ("Space", "Toggle"), ("/", "Filter"), ("Enter", "Keep"), ("Esc", "Back"))
+
+
+def _shortcut_width(shortcut):
+    key, label = shortcut
+    return len(key) + 2 + (len(label) + 1 if label else 0)
+
+
+def _shortcut_lines(shortcuts, width, limit):
+    if not limit:
+        return []
+
+    def pack(pairs, gap=3):
+        lines = []
+        used = width
+        for pair in pairs:
+            size = _shortcut_width(pair)
+            if size > width:
+                key, _ = pair
+                pair = (key, "")
+                size = _shortcut_width(pair)
+                if size > width:
+                    continue
+            if used + gap + size > width:
+                lines.append([])
+                used = 0
+            if used:
+                used += gap
+            lines[-1].append(pair)
+            used += size
+        return lines
+
+    lines = pack(shortcuts)
+    if len(lines) <= limit:
+        return lines
+    essential = {key for key, _ in shortcuts if key.split()[0] in {"Enter", "Esc", "Space", "/"}}
+    chosen = set(essential)
+    lines = pack(pair for pair in shortcuts if pair[0] in chosen)
+    if len(lines) > limit:
+        compact = pack(((key, "") for key, _ in shortcuts if key in chosen), gap=1)
+        if len(compact) <= limit:
+            return compact
+        chosen = {key for key in essential if key.split()[0] in {"Enter", "Esc"}}
+        lines = pack(pair for pair in shortcuts if pair[0] in chosen)
+        if len(lines) > limit:
+            return pack(((key, "") for key, _ in shortcuts if key in chosen), gap=1)[:limit]
+
+    for key, _ in shortcuts:
+        if key in chosen:
+            continue
+        candidate = pack(pair for pair in shortcuts if pair[0] in chosen or pair[0] == key)
+        if len(candidate) <= limit:
+            chosen.add(key)
+            lines = candidate
+    return lines
+
+
+@dataclass(frozen=True)
+class _Layout:
+    left: int
+    width: int
+    padding: int
+    top: int
+    available: int
+    framed: bool
+    footer: list[list[tuple[str, str]]]
+
+    @property
+    def content_left(self):
+        return self.left + self.padding
+
+    @property
+    def content_width(self):
+        return _content_width(self.width, self.padding)
+
+
+def _layout(height, width, has_subtitle, shortcuts=()):
+    framed = height >= 19 and width >= 40
+    panel_width = min(width, 100) if framed else width
+    padding = 4 if framed and width >= 58 else 3 if framed else 2
+    footer = _shortcut_lines(shortcuts, _content_width(panel_width, padding),
+                             2 if height >= 14 else int(height >= 3))
+    if framed:
+        top = 7 if has_subtitle else 6
+        available = height - top - 3 - len(footer)
+    else:
+        top = 2 if height >= 7 else 1
+        if has_subtitle and height >= 8:
+            top += 2
+        available = height - top - len(footer)
+    return _Layout((width - panel_width) // 2, panel_width, padding, top, max(0, available), framed, footer)
+
+
+def _content_width(width, margin=4):
+    return max(1, min(width, 100) - 2 * margin - 1)
+
+
 class _Terminal:
     def __init__(self, window):
         self.window = window
+        self.hostname = socket.gethostname()
         try:
             curses.curs_set(0)
         except curses.error:
@@ -58,51 +191,225 @@ class _Terminal:
         self.styles = {
             "title": curses.A_BOLD,
             "section": curses.A_BOLD,
-            "focus": curses.A_REVERSE,
+            "focus": curses.A_REVERSE | curses.A_BOLD,
+            "focus-danger": curses.A_REVERSE | curses.A_BOLD,
             "plain": curses.A_NORMAL,
+            "input": curses.A_NORMAL,
+            "input-focus": curses.A_BOLD,
+            "border": curses.A_DIM,
+            "border-focus": curses.A_BOLD,
+            "rule": curses.A_DIM,
+            "key": curses.A_REVERSE | curses.A_BOLD,
+            "footer-label": curses.A_NORMAL,
+            "link": curses.A_BOLD,
             "muted": curses.A_DIM,
             "danger": curses.A_BOLD,
+            "accent": curses.A_BOLD,
+            "ok": curses.A_NORMAL,
+            "warn": curses.A_BOLD,
+            "bad": curses.A_BOLD,
         }
         if curses.has_colors() and not os.environ.get("NO_COLOR"):
             try:
                 curses.use_default_colors()
-                curses.init_pair(1, curses.COLOR_GREEN, -1)
-                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
-                curses.init_pair(3, curses.COLOR_RED, -1)
-                self.styles["title"] = curses.color_pair(1) | curses.A_BOLD
-                self.styles["section"] = curses.color_pair(1) | curses.A_BOLD
-                self.styles["focus"] = curses.color_pair(2) | curses.A_BOLD
-                self.styles["danger"] = curses.color_pair(3) | curses.A_BOLD
+                if curses.COLORS >= 256 and curses.COLOR_PAIRS > len(self.styles):
+                    palette = {
+                        "title": (78, 233), "section": (79, 233), "plain": (252, 233),
+                        "focus": (253, 236), "focus-danger": (203, 236),
+                        "input": (253, 234), "input-focus": (253, 236),
+                        "border": (66, 234), "border-focus": (79, 236),
+                        "rule": (66, 233), "muted": (246, 233),
+                        "key": (253, 238), "footer-label": (249, 234), "link": (79, 233),
+                        "danger": (203, 233), "accent": (78, 233), "ok": (78, 233),
+                        "warn": (221, 233), "bad": (203, 233),
+                    }
+                    for pair, (style, colors) in enumerate(palette.items(), start=1):
+                        curses.init_pair(pair, *colors)
+                        emphasis = self.styles[style] & ~(curses.A_DIM | curses.A_REVERSE)
+                        self.styles[style] = curses.color_pair(pair) | emphasis
+                else:
+                    for pair, (color, styles) in enumerate((
+                        (curses.COLOR_GREEN, ("title", "section", "accent", "ok", "border-focus")),
+                        (curses.COLOR_YELLOW, ("warn",)),
+                        (curses.COLOR_RED, ("danger", "bad", "focus-danger")),
+                    ), start=1):
+                        curses.init_pair(pair, color, -1)
+                        for style in styles:
+                            self.styles[style] |= curses.color_pair(pair)
             except curses.error:
                 pass
 
     def size(self):
         return self.window.getmaxyx()
 
-    def paint(self, title, subtitle, rows, index, help_text):
+    def paint(self, title, subtitle, rows: list[Row], index, shortcuts: Shortcuts, *, pinned=0):
         height, width = self.size()
+        layout = _layout(height, width, bool(subtitle), shortcuts)
+        top, available = layout.top, layout.available
+        margin, content_width = layout.content_left, layout.content_width
         self.window.erase()
-        start_y = 2 if height >= 7 else 1
-        subtitle = textwrap.shorten(subtitle, width=max(2, width - 2), placeholder="…")
-        if subtitle and height >= 8:
-            self._line(start_y, subtitle, "muted")
-            start_y += 2
-        visible = max(0, height - start_y - 2)
-        start = min(max(0, index - visible + 1), max(0, len(rows) - visible))
-        for offset, (content, style) in enumerate(rows[start:start + visible]):
-            focused = start + offset == index
-            label = ("› " if focused else "  ") + content
-            self._line(start_y + offset, label, "focus" if focused else style)
-        self._line(0, title, "title")
-        if height >= 3:
-            self._line(height - 2, help_text, "muted")
+        note_column = margin
+        note_lines = []
+        if rows and rows[-1][1] == "note":
+            label, _, _ = rows[-2][0].partition("[ ")
+            if content_width - len(label) >= 31:
+                note_column += len(label)
+            note_lines = textwrap.wrap(rows[-1][0], content_width - note_column + margin)
+        field_count = sum(style == "field" for _, style in rows)
+        boxed = width >= 24 and available >= max(8, field_count * 3 + len(note_lines))
+        field_height = 3 if boxed else 1
+        sizes = []
+        for _, style in rows:
+            size = 1
+            if style == "field":
+                size = field_height
+            elif style == "note":
+                size = len(note_lines)
+            elif style in ("gap", "divider", "detail", "columns") and available < 6:
+                size = 0
+            elif style == "section" and available >= 10:
+                size = 2
+            sizes.append(size)
+        if layout.framed:
+            if boxed and field_count > 1:
+                gaps = [i for i in range(len(rows) - 1) if rows[i][1] == rows[i + 1][1] == "field"]
+                if sum(sizes) + len(gaps) <= available:
+                    for i in gaps:
+                        sizes[i] += 1
+            end = top + min(available, max(1, sum(sizes))) + len(layout.footer) + 2
+            self._frame(title, subtitle, end, layout)
+        else:
+            title_y = 0
+            if height >= 7:
+                self._line(0, fit(f"Flowvy MOTD  ·  {self.hostname}", width - 1), "muted")
+                title_y = 1
+            self._line(title_y, fit(title, width - 1), "title")
+            if subtitle and height >= 8:
+                self._line(title_y + 1, fit(subtitle, width - 1), "muted")
+            self._footer(height - len(layout.footer), layout)
+
+        pinned = min(pinned, available, len(rows))
+        budget = available - sum(sizes[:pinned])
+        start = pinned
+        through_focus = sum(sizes[pinned:index + 1]) if index >= pinned else 0
+        if 0 <= index < len(rows) - 1 and rows[index + 1][1] in ("note", "detail"):
+            if sizes[index] + sizes[index + 1] <= budget:
+                through_focus += sizes[index + 1]
+        y = top
+        shown_group = ""
+        while start < index and through_focus > budget:
+            through_focus -= sizes[start]
+            start += 1
+        for row_index in (*range(pinned), *range(start, len(rows))):
+            size = sizes[row_index]
+            if not size:
+                continue
+            if y + size > top + available:
+                break
+            content, style = rows[row_index]
+            focused = row_index == index
+            if style == "field":
+                self._field(y, content, focused, size, margin)
+            elif style == "note":
+                for offset, line in enumerate(note_lines):
+                    self._line(y + offset, line, "muted", note_column)
+            elif style == "body":
+                column = margin
+                for segment, tone in content:
+                    self._line(y, segment, tone, column)
+                    column += sum(map(char_width, segment))
+            elif style == "section":
+                self._line(y + size - 1, fit(content, content_width), style, margin)
+                shown_group = content
+            elif style == "detail":
+                self._line(y, fit(content, max(1, content_width - 8)), "muted", margin + 8)
+            elif style == "divider":
+                self._line(y, "─" * content_width, "rule", margin)
+            elif style != "gap":
+                self._entry(y, content, style, focused, shown_group, layout)
+            y += size
         self.window.refresh()
 
-    def _line(self, y, value, style):
+    def _entry(self, y, content, style, focused, shown_group, layout):
+        entry = content if isinstance(content, _Entry) else _Entry(content)
+        left, width = layout.content_left, layout.content_width
+        is_component = style in ("component", "columns")
+        indent = 4 if is_component else 2
+        tone = "muted" if style == "columns" else style if style in ("danger", "link", "muted") else "plain"
+        marker = "›" if focused else " "
+        if focused:
+            tone = "focus-danger" if style == "danger" else "focus"
+            self._line(y, " " * width, tone, left)
+            self._line(y, marker, tone, left + indent - 2)
+        label = entry.label
+        if entry.group and entry.group != shown_group:
+            check, closing, name = label.partition("] ")
+            label = f"{check}{closing}{entry.group.partition(' · ')[0]}/{name}"
+        label_width = max(1, width - indent)
+        if entry.value and width >= 42:
+            column = entry.value_column or min(44, width * 3 // 5)
+            label_width = column - indent - 2
+            self._line(y, fit(entry.value, width - column), tone if focused else entry.tone, left + column)
+        elif entry.value and style == "component":
+            name_width = label_width - len(entry.value) - 3
+            if name_width >= 16 or sum(map(char_width, label)) <= name_width:
+                label = _identifier(label, name_width) + " · " + entry.value
+        elif entry.value:
+            label = f"{label} · {entry.value}"
+        shorten = _identifier if style == "component" else fit
+        self._line(y, shorten(label, label_width), tone, left + indent)
+
+    def _frame(self, title, subtitle, end, layout):
+        left, width, margin = layout.left, layout.width, layout.content_left
+        rule = "─" * (width - 3)
+        footer_y = end - len(layout.footer)
+        self._line(0, "╭" + rule + "╮", "rule", left)
+        for y in range(1, end):
+            background = "input" if y == 1 or y >= footer_y else "plain"
+            self._line(y, " " * (width - 1), background, left)
+            self._line(y, "│", "rule", left)
+            self._line(y, "│", "rule", left + width - 2)
+        self._line(1, "● Flowvy MOTD", "input", margin)
+        name = fit(self.hostname, width - 23)
+        self._line(1, name, "input", margin + layout.content_width - sum(map(char_width, name)))
+        self._line(2, "├" + rule + "┤", "rule", left)
+        self._line(4, fit(title, layout.content_width), "title", margin)
+        if subtitle:
+            self._line(5, fit(subtitle, layout.content_width), "muted", margin)
+        self._line(footer_y - 1, "─" * layout.content_width, "rule", margin)
+        self._footer(footer_y, layout)
+        self._line(end, "╰" + rule + "╯", "rule", left)
+
+    def _footer(self, start, layout):
+        for offset, shortcuts in enumerate(layout.footer):
+            column = layout.content_left
+            gap = 3 if any(label for _, label in shortcuts) else 1
+            for key, label in shortcuts:
+                self._line(start + offset, f" {key} ", "key", column)
+                if label:
+                    self._line(start + offset, label, "footer-label", column + len(key) + 3)
+                column += _shortcut_width((key, label)) + gap
+
+    def _field(self, y, content, focused, size, margin):
+        label, _, value = content.partition("[ ")
+        value = " " + value.removesuffix(" ]") + " "
+        column = margin + len(label)
+        middle = y + (size > 1)
+        width = sum(map(char_width, value))
+        border = "border-focus" if focused else "border"
+        self._line(middle, label, "section", margin)
+        self._line(middle, "│", border, column)
+        self._line(middle, value, "input-focus" if focused else "input", column + 1)
+        self._line(middle, "│", border, column + width + 1)
+        if size > 1:
+            self._line(y, "╭" + "─" * width + "╮", border, column)
+            self._line(y + 2, "╰" + "─" * width + "╯", border, column)
+
+    def _line(self, y, value, style, column=0):
         height, width = self.size()
-        if 0 <= y < height and width > 1:
+        if 0 <= y < height and width > column + 1:
             try:
-                self.window.addnstr(y, 0, _text(value), width - 1, self.styles[style])
+                self.window.addnstr(y, column, _text(value), width - column - 1, self.styles[style])
             except curses.error:
                 pass
 
@@ -161,15 +468,37 @@ def _navigate(key, index, count):
     return index
 
 
-def _menu(screen, options, title, subtitle=""):
+def _navigation_rows(options, rows, sections, columns):
+    output, indexes = [], []
+    labels = [len(label.partition("  ·  ")[0]) for key, label in options if key in columns]
+    value_column = max(20, max(labels, default=0) + 4)
+    for (key, _), (label, style) in zip(options, rows):
+        if key in sections:
+            output.append(sections[key])
+        indexes.append(len(output))
+        if key in columns and style == "plain":
+            label, _, value = label.partition("  ·  ")
+            label = _Entry(label, value, value_column=value_column)
+        if key in {"uninstall", "remove", "keep", "delete"}:
+            style = "danger"
+        elif key in {"create", "done", "preview", "apply"}:
+            style = "link"
+        output.append((label, style))
+    return output, indexes
+
+
+def _menu(screen, options, title, subtitle="", *, sections=None, columns=()):
     if not options:
         return None
     if screen is None:
         return _plain_menu(options, title, subtitle)
     index = 0
-    rows = [(label, "danger" if key == "uninstall" else "plain") for key, label in options]
+    boundaries = sections if sections is not None else {
+        "update": ("Maintenance", "section"), "exit": ("", "divider"),
+    }
+    rows, indexes = _navigation_rows(options, [(label, "plain") for _, label in options], boundaries, columns)
     while True:
-        screen.paint(title, subtitle, rows, index, "↑ ↓ Move   Enter Select   Esc Back")
+        screen.paint(title, subtitle, rows, indexes[index], _MENU_KEYS)
         key = screen.key()
         if key == "\x1b":
             return None
@@ -182,49 +511,70 @@ def menu(options: list[Option], *, title: str, subtitle: str = "") -> str | None
     return _run(lambda screen: _menu(screen, options, title, subtitle))
 
 
-def _input(screen, title, value="", *, subtitle=""):
-    if screen is None:
-        print(f"\n{title}")
-        if subtitle:
-            print(subtitle)
-        answer = input(f"[{value}] (use - to clear): ")
-        return "" if answer == "-" else answer or value
-    content = value
-    while True:
-        _, width = screen.size()
-        tail = content[-max(1, width - 7):]
-        screen.paint(title, subtitle, [(tail + "▌", "plain")], -1,
-                     "Enter Accept   Esc Cancel   Ctrl-U Clear")
-        key = screen.key()
-        if key == "\x1b":
-            return None
-        if key in _ENTER:
-            return content
-        if key in _BACKSPACE:
-            content = content[:-1]
-        elif key == "\x15":
-            content = ""
-        elif isinstance(key, str) and key.isprintable() and len(content) < 512:
-            content += key
+def _plain_input(title, label, value):
+    print(f"\n{title} › {label}")
+    width = shutil.get_terminal_size((80, 24)).columns
+    print("  " + _field_row(label, value, width))
+    answer = input("Value (- clear, :cancel back): ")
+    if answer in ("", "\x1b", ":cancel"):
+        return None
+    return "" if answer == "-" else answer
 
 
-def _show(screen, title, body):
-    plain = _ANSI.sub("", body).expandtabs()
+def _body_rows(body, width):
+    rows = []
+    for line in body.expandtabs().splitlines():
+        spans = []
+        remaining = width
+        tone = "plain"
+        for token in _BODY_TOKENS.findall(line):
+            if token.startswith("\x1b"):
+                tone = _BODY_TONES.get(token, tone)
+                continue
+            for char in _text(token):
+                size = char_width(char)
+                if size > width:
+                    char, size = "…", 1
+                if size > remaining:
+                    rows.append((spans, "body"))
+                    spans = []
+                    remaining = width
+                if spans and spans[-1][1] == tone:
+                    spans[-1] = (spans[-1][0] + char, tone)
+                else:
+                    spans.append((char, tone))
+                remaining -= size
+        rows.append((spans, "body"))
+    return rows
+
+
+def _show(screen, title, body, *, advance=False):
     if screen is None:
+        plain = _ANSI.sub("", body).expandtabs()
         print(f"\n{title}\n\n{plain.rstrip()}")
         if sys.stdin.isatty():
+            if advance:
+                return input("\nPress Enter to continue (:cancel to go back). ") not in ("\x1b", ":cancel")
             input("\nPress Enter to go back. ")
         return True
     first = 0
+    previous_width = 0
+    rows = []
+    keys = (("Enter", "Continue"), ("Esc", "Back")) if advance else (("Enter / Esc", "Back"),)
     while True:
         height, width = screen.size()
-        width = max(1, width - 3)
-        rows = [(part, "plain") for line in plain.split("\n")
-                for part in (textwrap.wrap(line, width, replace_whitespace=False,
-                                           drop_whitespace=False) or [""])]
-        visible = max(1, height - 4)
+        layout = _layout(height, width, False, keys)
+        content_width = layout.content_width
+        if content_width != previous_width:
+            rows = _body_rows(body, content_width)
+            previous_width = content_width
+        shortcuts = keys
+        if len(rows) > layout.available:
+            shortcuts = (("↑ ↓", "Scroll"), ("PgUp / PgDn", "Page"), *keys)
+            layout = _layout(height, width, False, shortcuts)
+        visible = max(1, layout.available)
         first = min(first, max(0, len(rows) - visible))
-        screen.paint(title, "", rows[first:first + visible], -1, "↑ ↓ Scroll   Enter / Esc Back")
+        screen.paint(title, "", rows[first:first + visible], -1, shortcuts)
         key = screen.key()
         if key in _ENTER:
             return True
@@ -247,12 +597,12 @@ def show_text(title: str, body: str) -> None:
 def confirm_uninstall(paths: Iterable[str] = ()) -> bool | None:
     def decide(screen):
         files = "\n".join(f"  {path}" for path in paths)
-        if files and not _show(screen, "Flowvy MOTD files", files):
+        if files and not _show(screen, "Flowvy MOTD files", files, advance=True):
             return None
         choice = _menu(screen, [
             ("cancel", "Cancel"),
-            ("remove", "Uninstall Flowvy MOTD and remove settings"),
-            ("keep", "Uninstall Flowvy MOTD and keep settings"),
+            ("remove", "Remove settings and uninstall"),
+            ("keep", "Keep settings and uninstall"),
         ], "Confirm uninstall", "System packages and OS login settings are kept.")
         if choice in ("remove", "keep"):
             return choice == "keep"
@@ -266,17 +616,7 @@ class _Selection:
         self.items = sorted(items, key=lambda item: (item.source, not bool(item.group),
                                                        item.group.casefold(), item.name.casefold()))
         self.selected = list(dict.fromkeys(selected))
-        self.tab = 0
         self.query = ""
-        self.search_both = False
-
-    def search(self, query):
-        self.query = query.strip().casefold()
-        self.search_both = bool(self.query)
-
-    def switch(self):
-        self.tab = 1 - self.tab
-        self.search_both = False
 
     def toggle(self, identity):
         if identity in self.selected:
@@ -284,64 +624,75 @@ class _Selection:
         else:
             self.selected.append(identity)
 
-    def results(self):
-        result = []
-        for item in self.items:
-            if not self.search_both and item.source != _SOURCES[self.tab]:
-                continue
-            haystack = " ".join((item.id, item.name, item.description, item.group,
-                                 item.search_text)).casefold()
-            if all(word in haystack for word in self.query.split()):
-                result.append(item)
-        return result
+    def results(self, query):
+        words = query.casefold().split()
+        return [item for item in self.items if all(word in self._searchable(item) for word in words)]
+
+    @staticmethod
+    def _searchable(item):
+        return " ".join((item.id, item.name, item.description, item.group, item.search_text)).casefold()
+
+    def empty(self, noun, query):
+        if self.items and query.strip():
+            return f"No {noun} match the filter."
+        return f"No {noun} found."
 
 
-def _picker(screen, items, selected, title):
+def _picker(screen, items, selected, title, noun):
     controller = _Selection(items, selected)
     if screen is None:
-        return _plain_picker(controller, title)
+        return _plain_picker(controller, title, noun)
 
     index = 0
+    editor = None
     while True:
-        results = controller.results()
-        index = min(index, max(0, len(results) - 1))
-        rows, indexes = _picker_rows(results, controller.selected)
-        tabs = ("Services + Containers" if controller.search_both else
-                "[Services]  Containers" if controller.tab == 0 else "Services  [Containers]")
-        status = f"{tabs}   ·   {len(controller.selected)} selected"
-        if controller.query:
-            status += f"   / {controller.query}"
-        if results:
-            description = results[index].description
-            if description and description != results[index].name:
-                status += f"   ·   {description}"
-        screen.paint(title, status, rows, indexes[index] if indexes else -1,
-                     "↑ ↓ Move  Space Select  Tab Tab  / Search  Enter Continue  Esc Back")
+        query = editor.value if editor else controller.query
+        results = controller.results(query)
+        height, width = screen.size()
+        shortcuts = _EDIT_KEYS if editor is not None else _PICKER_KEYS
+        layout = _layout(height, width, True, shortcuts)
+        rows = [(_field_row("Filter", query, layout.content_width + 3, editor=editor,
+                            placeholder="Search by name", label_width=11, full_width=True), "field")]
+        if layout.available >= 11 and results:
+            if layout.content_width >= 42:
+                rows.append((_Entry(noun.removesuffix("s").capitalize(), "Status"), "columns"))
+        pinned = len(rows)
+        current = 0 if editor is not None and editor.modified else index
+        entries, indexes = _picker_rows(results, controller.selected, detail_index=current)
+        rows.extend(entries or [(controller.empty(noun, query), "muted")])
+        status = f"{len(controller.selected)} selected  ·  {len(results)} shown"
+        focus = 0 if editor is not None else indexes[index] + pinned if indexes else len(rows) - 1
+        screen.paint(title, status, rows, focus, shortcuts, pinned=pinned if layout.available >= 2 else 0)
         key = screen.key()
-        if key == "\x1b":
+        if editor is not None:
+            if key in _ENTER:
+                query = editor.value.strip()
+                if query != controller.query:
+                    index = 0
+                controller.query = query
+                editor = None
+            elif key == "\x1b":
+                editor = None
+            else:
+                editor.key(key)
+        elif key == "\x1b":
             return None
-        if key in _ENTER:
+        elif key in _ENTER:
             return controller.selected
-        if key == "\t":
-            controller.switch()
-            index = 0
         elif key == "/":
-            query = _input(screen, "Search services and containers", controller.query,
-                           subtitle="Search by name, description, Debian package, project, or image.")
-            if query is not None:
-                controller.search(query)
-                index = 0
+            editor = _InlineField(controller.query)
         elif results and key == " ":
             controller.toggle(results[index].id)
         elif results:
             index = _navigate(key, index, len(results))
 
 
-def _picker_rows(results, selected) -> tuple[list[Row], list[int]]:
+def _picker_rows(results, selected, *, detail_index=-1) -> tuple[list[Row], list[int]]:
     rows = []
     indexes = []
     previous_group = None
-    for item in results:
+    names = Counter(item.name for item in results)
+    for index, item in enumerate(results):
         group = (item.source, item.group_kind, item.group)
         if group != previous_group:
             if item.group:
@@ -354,66 +705,42 @@ def _picker_rows(results, selected) -> tuple[list[Row], list[int]]:
         indexes.append(len(rows))
         checked = "x" if item.id in selected else " "
         status = _STATE_LABELS.get(item.state, item.state.replace("-", " ").capitalize())
-        rows.append((f"[{checked}] {item.name}  ·  {status}", "plain"))
-    if not rows:
-        rows.append(("No matching components", "muted"))
+        name = item.name
+        context = heading if item.group else ""
+        if item.group and names[name] > 1:
+            name = f"{item.group}/{name}" if item.group_kind == "compose" else f"{name} ({item.group})"
+            context = ""
+        tone = STATUS.get(item.state, ("muted", ""))[0]
+        rows.append((_Entry(f"[{checked}] {name}", status, tone, context), "component"))
+        if index == detail_index and item.description and item.description != item.name:
+            rows.append((item.description, "detail"))
     return rows, indexes
 
 
-def _plain_picker(controller, title):
+def _plain_picker(controller, title, noun):
     while True:
+        results = controller.results(controller.query)
+        width = shutil.get_terminal_size((80, 24)).columns
         options = []
-        for index, component in enumerate(controller.results()):
+        for index, component in enumerate(results):
             selected = "x" if component.id in controller.selected else " "
             metadata = f"  ·  {component.group}" if component.group else ""
             options.append((str(index), f"[{selected}] {component.name}{metadata}"))
-        options.extend([
-            ("tab", "Switch between services and containers"),
-            ("search", "Search both lists"),
-            ("continue", "Continue with selection"),
-        ])
-        choice = _plain_menu(options, title, f"{len(controller.selected)} selected")
+        options.extend([("filter", "Edit filter"), ("continue", "Continue with selection")])
+        count = f"{len(controller.selected)} selected  ·  {len(results)} shown"
+        field = _field_row("Filter", controller.query, width, placeholder="Search by name")
+        empty = f"\n{controller.empty(noun, controller.query)}" if not results else ""
+        choice = _plain_menu(options, title, f"{count}\n  {field}{empty}")
         if choice is None:
             return None
         if choice == "continue":
             return controller.selected
-        if choice == "tab":
-            controller.switch()
-        elif choice == "search":
-            controller.search(_input(None, "Search", controller.query))
+        if choice == "filter":
+            value = _plain_input(title, "Filter", controller.query)
+            if value is not None:
+                controller.query = _text(value).strip()
         else:
-            controller.toggle(controller.results()[int(choice)].id)
-
-
-def _top_level_ids(config):
-    services = ("unit:" + unit for unit in config.get("services", []))
-    containers = (name if name.startswith(("compose:", "container:")) else "container:" + name
-                  for name in config.get("containers", []))
-    return [*services, *containers]
-
-
-def _selected_ids(config):
-    members = (identity for group in config.get("applications", []) for identity in group["members"])
-    return list(dict.fromkeys((*_top_level_ids(config), *members)))
-
-
-def _replace_selection(config, selected):
-    draft = deepcopy(config)
-    grouped_only = set(_selected_ids(config)) - set(_top_level_ids(config))
-    top_level = [identity for identity in selected if identity not in grouped_only]
-    draft["services"] = [item.removeprefix("unit:") for item in top_level if item.startswith("unit:")]
-    draft["containers"] = [item for item in top_level if item.startswith(("compose:", "container:"))]
-    available = set(selected)
-    groups = []
-    for group in draft.get("applications", []):
-        members = [identity for identity in group["members"] if identity in available]
-        if members:
-            group["members"] = members
-            if group.get("primary") not in members:
-                group["primary"] = ""
-            groups.append(group)
-    draft["applications"] = groups
-    return draft
+            controller.toggle(results[int(choice)].id)
 
 
 def _with_missing(items, selected):
@@ -428,114 +755,145 @@ def _with_missing(items, selected):
     return list(by_id.values())
 
 
-def _suggest_groups(items, applications):
-    attached = {identity for group in applications for identity in group.get("members", [])}
-    grouped = {}
-    for item in items:
-        if item.group and item.id not in attached:
-            key = (item.group_kind, item.group)
-            grouped.setdefault(key, []).append(item.id)
-    return [{"name": f"{name} ({_GROUP_KIND.get(kind, 'group')})", "members": members,
-             "primary": "", "check_url": ""}
-            for (kind, name), members in sorted(grouped.items())]
+def _top_level_ids(draft, field):
+    values = draft.get(field, [])
+    if field == "services":
+        return ["unit:" + name for name in values]
+    return [name if name.startswith(("compose:", "container:")) else "container:" + name
+            for name in values]
+
+
+def _grouped_ids(draft):
+    return {member for group in draft.get("applications", []) for member in group["members"]}
+
+
+def _standalone_count(draft, field):
+    return len(set(_top_level_ids(draft, field)) - _grouped_ids(draft))
+
+
+def _select_standalone(screen, draft, items, field):
+    containers = field == "containers"
+    source = "docker" if containers else "systemd"
+    current = _top_level_ids(draft, field)
+    grouped = _grouped_ids(draft)
+    selected = [identity for identity in current if identity not in grouped]
+    available = _with_missing([item for item in items if item.source == source and item.id not in grouped], selected)
+    title = "Select containers" if containers else "Select standalone services"
+    result = _picker(screen, available, selected, title, field)
+    if result is not None and result != selected:
+        keep = grouped | set(result)
+        preserved = [value for identity, value in zip(current, draft.get(field, [])) if identity in keep]
+        added = [identity for identity in result if identity not in current]
+        draft[field] = preserved + (added if containers else [identity.removeprefix("unit:") for identity in added])
+
+
+def _keep_ungrouped(draft, members):
+    seen = _grouped_ids(draft) | set(_top_level_ids(draft, "services") + _top_level_ids(draft, "containers"))
+    for identity in members:
+        if identity in seen:
+            continue
+        if identity.startswith("unit:"):
+            draft.setdefault("services", []).append(identity.removeprefix("unit:"))
+        else:
+            draft.setdefault("containers", []).append(identity)
+        seen.add(identity)
 
 
 def _group_editor(screen, group, eligible, existing_names, existing):
     draft = deepcopy(group)
     by_id = {item.id: item.name for item in eligible}
-    while True:
-        label = by_id.get(draft["primary"], "None")
-        options = [
-            ("name", f"Name  ·  {draft['name'] or 'Not set'}"),
-            ("members", f"Components  ·  {len(draft['members'])} selected"),
-            ("primary", f"Primary component  ·  {label}"),
-            ("check", f"Local HTTP check  ·  {draft['check_url'] or 'None'}"),
-            ("done", "Keep group in configuration draft"),
+    has_legacy_containers = any(not member.startswith("unit:") for member in group["members"])
+    member_label = "Members" if has_legacy_containers else "Services"
+    primary_label = "Primary member" if has_legacy_containers else "Primary service"
+    title = "Edit service group" if existing else "Create service group"
+    focus = 0
+    sections = {
+        "members": ("Membership", "section"),
+        "check_url": ("", "gap"),
+        "done": ("", "divider"),
+    }
+
+    def options():
+        return [
+            ("name", "Group name"),
+            ("members", f"{member_label}  ·  {len(draft['members'])} selected"),
+            ("primary", f"{primary_label}  ·  {by_id.get(draft['primary'], 'None')}"),
+            ("check_url", "Local HTTP check"),
+            ("done", "Keep group in draft"),
+            *([("delete", "Remove grouping (keep members)")] if existing else []),
+            ("back", "Cancel"),
         ]
-        if existing:
-            options.append(("delete", "Remove grouping"))
-        options.append(("back", "Back"))
-        choice = _menu(screen, options, "Application group")
+
+    while True:
+        choice, focus = _form_choice(screen, title, draft, options, _GROUP_FIELDS, focus,
+                                     sections=sections, columns={"members", "primary"})
         if choice in (None, "back"):
             return None
         if choice == "delete":
             return {}
-        if choice == "name":
-            value = _input(screen, "Application name", draft["name"])
-            if value is not None:
-                draft["name"] = value.strip()
-        elif choice == "members":
-            value = _picker(screen, eligible, draft["members"], "Select group components")
+        if choice == "members":
+            noun = "members" if has_legacy_containers else "services"
+            value = _picker(screen, eligible, draft["members"], f"Select {noun}", noun)
             if value is not None:
                 draft["members"] = value
                 if draft["primary"] not in value:
                     draft["primary"] = ""
         elif choice == "primary":
-            options = [("", "No primary component")]
-            options.extend((member, by_id[member]) for member in draft["members"] if member in by_id)
-            value = _menu(screen, options, "Primary component",
-                          "Choose the component that reflects the application's main function.")
+            choices = [("", f"No {primary_label.lower()}")]
+            choices.extend((member, by_id[member]) for member in draft["members"] if member in by_id)
+            value = _menu(screen, choices, primary_label,
+                          "Choose what reflects the application's main function.")
             if value is not None:
                 draft["primary"] = value
-        elif choice == "check":
-            value = _input(screen, "Local HTTP check", draft["check_url"],
-                           subtitle="Optional. Example: http://127.0.0.1:8080/health")
-            if value is not None:
-                from .settings import SettingsError, probe_target
-
-                value = value.strip()
-                try:
-                    if value:
-                        probe_target(value)
-                except SettingsError as error:
-                    _show(screen, "Invalid HTTP check", str(error))
-                else:
-                    draft["check_url"] = value
         elif choice == "done":
             if not draft["name"] or not draft["members"]:
-                _show(screen, "Incomplete application group", "Choose a name and at least one component.")
+                _show(screen, "Incomplete service group", "Enter a name and choose at least one member.")
             elif draft["name"].casefold() in existing_names:
-                _show(screen, "Duplicate application name", "Choose a different name.")
+                _show(screen, "Duplicate group name", "Choose a different name.")
             else:
                 return draft
 
 
 def _edit_groups(screen, draft, items):
-    selected = set(_selected_ids(draft))
-    items = [item for item in _with_missing(items, selected) if item.id in selected]
-    groups = draft.setdefault("applications", [])
+    groups = draft.get("applications", [])
     while True:
-        suggestions = _suggest_groups(items, groups)
-        options = [(f"existing:{i}", f"Edit {group['name']}") for i, group in enumerate(groups)]
-        options.extend((f"suggested:{i}", f"Group {group['name']}") for i, group in enumerate(suggestions))
-        attached = {identity for group in groups for identity in group["members"]}
-        if any(item.id not in attached for item in items):
-            options.append(("custom", "Create a custom application group"))
-        options.append(("back", "Back"))
-        choice = _menu(screen, options, "Application groups",
-                       "Groups combine selected components into one MOTD row.")
+        options = [("create", "Create service group")]
+        options.extend((f"group:{i}", f"Edit {group['name']}") for i, group in enumerate(groups))
+        options.extend([
+            ("standalone", f"Standalone services  ·  {_standalone_count(draft, 'services')} selected"),
+            ("back", "Back"),
+        ])
+        sections = {"group:0": ("Groups", "section"), "standalone": ("", "divider")}
+        choice = _menu(screen, options, "Service groups", "Each group appears as one row in MOTD.",
+                       sections=sections, columns={"standalone"})
         if choice in (None, "back"):
             return
-        action, _, index = choice.partition(":")
-        existing = action == "existing"
+        if choice == "standalone":
+            _select_standalone(screen, draft, items, "services")
+            continue
+        existing = choice.startswith("group:")
         if existing:
-            i = int(index)
-            group = groups[i]
-        elif action == "suggested":
-            group = suggestions[int(index)]
+            index = int(choice.partition(":")[2])
+            group = groups[index]
         else:
             group = {"name": "", "members": [], "primary": "", "check_url": ""}
-        existing_names = {other["name"].casefold() for other in groups if other is not group}
-        eligible = [item for item in items if item.id not in attached or item.id in group["members"]]
-        result = _group_editor(screen, group, eligible, existing_names, existing)
+        other_groups = [other for other in groups if other is not group]
+        occupied = {member for other in other_groups for member in other["members"]}
+        eligible = [item for item in items if item.id in group["members"]
+                    or (item.source == "systemd" and item.id not in occupied)]
+        configured = [unit for unit in _top_level_ids(draft, "services") if unit not in occupied]
+        result = _group_editor(screen, group, _with_missing(eligible, group["members"] + configured),
+                               {other["name"].casefold() for other in other_groups}, existing)
         if result is None:
             continue
-        if not result and existing:
-            groups.pop(i)
+        if not result:
+            groups.pop(index)
+            _keep_ungrouped(draft, group["members"])
         elif existing:
-            groups[i] = result
+            groups[index] = result
         else:
             groups.append(result)
+        draft["applications"] = groups
 
 
 class _LocationDetection:
@@ -570,9 +928,10 @@ class _LocationDetection:
 
 
 class _InlineField:
-    def __init__(self, value):
+    def __init__(self, value, limit=160):
         self.value = value
         self.cursor = len(value)
+        self.limit = limit
         self.modified = False
 
     def key(self, key):
@@ -594,80 +953,99 @@ class _InlineField:
         elif key == "\x15":
             self.value = ""
             self.cursor = 0
-        elif isinstance(key, str) and key.isprintable() and len(value) < 160:
+        elif isinstance(key, str) and key.isprintable() and len(value) < self.limit:
             self.value = value[:index] + key + value[index:]
             self.cursor += 1
         self.modified = self.modified or self.value != value or key == "\x15"
 
-    def row(self, label, width):
-        limit = max(1, width - 3)
-        prefix = f"{label}  ·  "
-        if limit < len(prefix) + 3:
-            prefix = label[:max(0, limit - 4)] + " "
-        remaining = max(0, limit - len(prefix) - 3)
+    def display(self, width):
+        remaining = width - 1
         left = []
         for char in reversed(self.value[:self.cursor]):
-            remaining -= char_width(char)
-            if remaining < 0:
-                remaining = 0
+            if char_width(char) > remaining:
                 break
+            remaining -= char_width(char)
             left.append(char)
         right = []
         for char in self.value[self.cursor:]:
-            remaining -= char_width(char)
-            if remaining < 0:
+            if char_width(char) > remaining:
                 break
+            remaining -= char_width(char)
             right.append(char)
-        return prefix + "[" + "".join(reversed(left)) + "▌" + "".join(right) + "]"
+        return "".join(reversed(left)) + "▌" + "".join(right)
 
 
-def _config_options(draft):
-    style = "Compact" if draft.get("compact") else "Automatic"
+def _field_row(label, value, width, *, editor=None, placeholder="Not set", label_width=0,
+               full_width=False):
+    available = max(1, width - 3)
+    maximum = max(0, available - 7)
+    label = fit(label, maximum) if maximum else ""
+    column = min(max(len(label), label_width), maximum)
+    prefix = label.ljust(column) + "  "
+    interior = max(1, available - len(prefix) - 4)
+    if not full_width:
+        interior = min(46, interior)
+    if editor is not None:
+        content = editor.display(interior)
+    else:
+        content = fit(value or placeholder, interior)
+    padding = " " * max(0, interior - sum(map(char_width, content)))
+    return prefix + "[ " + content + padding + " ]"
+
+
+def _form_rows(options, fields, draft, width, index=-1, editor=None):
+    column = max(map(len, fields.values()), default=0)
     return [
-        *((field, f"{label}  ·  {draft.get(field) or 'Not set'}") for field, label in _CONFIG_FIELDS.items()),
-        ("selection", f"Services and containers  ·  {len(_selected_ids(draft))} selected"),
-        ("groups", f"Application groups  ·  {len(draft.get('applications', []))}"),
-        ("layout", f"Display  ·  {style}"),
-        ("preview", "Preview and apply"),
-        ("back", "Cancel"),
+        (_field_row(fields[key], draft.get(key, ""), width, label_width=column,
+                    editor=editor if row == index else None,
+                    placeholder="Optional" if key == "check_url" else "Not set"), "field")
+        if key in fields else (label, "plain")
+        for row, (key, label) in enumerate(options)
     ]
 
 
-def _config_choice(screen, draft, detection, index):
-    title = "Configure Flowvy MOTD"
+def _save_field(screen, draft, field, label, value):
+    try:
+        value = config_text(value, label, _FIELD_LIMITS.get(field, 160))
+        if field == "check_url" and value:
+            probe_target(value)
+    except SettingsError as error:
+        _show(screen, f"Invalid {label.lower()}", str(error))
+        return False
+    draft[field] = value
+    return True
+
+
+def _form_choice(screen, title, draft, get_options, fields, index, *, subtitle="", sections=None, columns=()):
     if screen is None:
-        detection.refresh(draft)
-        choice = _plain_menu(_config_options(draft), title, detection.note)
-        detection.refresh(draft)
-        return choice, index
+        while True:
+            options = get_options()
+            width = shutil.get_terminal_size((80, 24)).columns
+            number_width = len(f"  {len(options)}. ")
+            rows = _form_rows(options, fields, draft, width - number_width)
+            choices = [(key, row) for (key, _), (row, _) in zip(options, rows)]
+            choice = _plain_menu(choices, title, subtitle)
+            if choice not in fields:
+                return choice, index
+            value = _plain_input(title, fields[choice], draft.get(choice, ""))
+            if value is not None:
+                _save_field(screen, draft, choice, fields[choice], value)
 
     editor = None
     while True:
-        detection.refresh(draft)
-        options = _config_options(draft)
+        options = get_options()
         choice = options[index][0]
-        rows = [(label, "plain") for _, label in options]
-        subtitle = detection.note
-        if editor is None:
-            hint = "↑ ↓ Move   Enter Select   Esc Back"
-        else:
-            if choice == "location":
-                if editor.modified:
-                    subtitle = ""
-                elif not editor.value and draft.get("location"):
-                    editor = _InlineField(draft["location"])
-            _, width = screen.size()
-            rows[index] = (editor.row(_CONFIG_FIELDS[choice], width), "plain")
-            hint = "← → Cursor   Enter Apply   Esc Cancel   Ctrl-U Clear"
-        screen.paint(title, subtitle, rows, index, hint)
-        key = screen.key(timeout=100) if detection.lookup is not None else screen.key()
+        height, width = screen.size()
+        shortcuts = _MENU_KEYS if editor is None else _EDIT_KEYS
+        layout = _layout(height, width, bool(subtitle), shortcuts)
+        rows = _form_rows(options, fields, draft, layout.content_width + 3, index, editor)
+        rows, indexes = _navigation_rows(options, rows, sections or {}, columns)
+        screen.paint(title, subtitle, rows, indexes[index], shortcuts)
+        key = screen.key()
         if editor is not None:
             if key in _ENTER:
-                if choice != "location" or editor.modified:
-                    draft[choice] = editor.value.strip()
-                    if choice == "location":
-                        detection.edited()
-                editor = None
+                if _save_field(screen, draft, choice, fields[choice], editor.value):
+                    editor = None
             elif key == "\x1b":
                 editor = None
             else:
@@ -675,33 +1053,112 @@ def _config_choice(screen, draft, detection, index):
         elif key == "\x1b":
             return None, index
         elif key in _ENTER:
-            if choice not in _CONFIG_FIELDS:
+            if choice not in fields:
                 return choice, index
-            editor = _InlineField(draft.get(choice, ""))
+            editor = _InlineField(draft.get(choice, ""), _FIELD_LIMITS.get(choice, 160))
         else:
             index = _navigate(key, index, len(options))
+
+
+def _host_details(screen, draft, detection):
+    title = "Host details"
+    subtitle = "Shown on the SSH dashboard."
+    fields = tuple(_CONFIG_FIELDS)
+    editors = {field: _InlineField(draft.get(field, "")) for field in fields}
+    focus = 0
+    while True:
+        detection.refresh(draft)
+        location = editors["location"]
+        if not location.modified and location.value != draft.get("location", ""):
+            editors["location"] = location = _InlineField(draft["location"])
+        note = "" if location.modified else detection.note
+        if screen is None:
+            width = shutil.get_terminal_size((80, 24)).columns - 5
+            options = [(field, _field_row(label, editors[field].value, width, label_width=11))
+                       for field, label in _CONFIG_FIELDS.items()]
+            if note:
+                field, row = options[-1]
+                details = textwrap.wrap(note, max(1, width))
+                options[-1] = (field, row + "\n" + textwrap.indent("\n".join(details), " " * 5))
+            options.extend([("keep", "Keep changes"), ("cancel", "Cancel")])
+            choice = _plain_menu(options, title, subtitle)
+            if choice in (None, "cancel"):
+                return
+            if choice != "keep":
+                answer = _plain_input(title, _CONFIG_FIELDS[choice], editors[choice].value)
+                if answer is not None:
+                    editors[choice] = editor = _InlineField(answer)
+                    editor.modified = True
+                continue
+        else:
+            height, width = screen.size()
+            shortcuts = _HOST_KEYS
+            if height < 14 and width < 56:
+                shortcuts = (("Tab", "Next"), ("Enter", "Keep"), ("Esc", ""))
+            layout = _layout(height, width, True, shortcuts)
+            label_width = max(11, min(24, layout.content_width // 4 - 3))
+            rows = [(_field_row(_CONFIG_FIELDS[field], editors[field].value, layout.content_width + 3,
+                                editor=editors[field] if i == focus else None,
+                                label_width=label_width, full_width=True), "field")
+                    for i, field in enumerate(fields)]
+            if note:
+                rows.append((note, "note"))
+            screen.paint(title, subtitle, rows, focus, shortcuts)
+            key = screen.key(timeout=100) if detection.lookup is not None else screen.key()
+            if key == "\x1b":
+                return
+            if key in ("\t", curses.KEY_DOWN):
+                focus = (focus + 1) % len(fields)
+            elif key in (curses.KEY_BTAB, curses.KEY_UP):
+                focus = (focus - 1) % len(fields)
+            elif key not in _ENTER:
+                editors[fields[focus]].key(key)
+            if key not in _ENTER:
+                continue
+
+        changes = {}
+        for i, field in enumerate(fields):
+            editor = editors[field]
+            if editor.modified and not _save_field(screen, changes, field, _CONFIG_FIELDS[field], editor.value):
+                focus = i
+                break
+        else:
+            draft.update(changes)
+            if "location" in changes:
+                detection.edited()
+            return
+
+
+def _config_options(draft):
+    style = "Compact" if draft.get("compact") else "Automatic"
+    return [
+        ("host", "Host details"),
+        ("groups", f"Service groups  ·  {len(draft.get('applications', []))}"),
+        ("containers", f"Containers  ·  {_standalone_count(draft, 'containers')} selected"),
+        ("layout", f"Display  ·  {style}"),
+        ("preview", "Preview and apply"),
+        ("back", "Cancel"),
+    ]
 
 
 def _edit(screen, config, items, preview, detection):
     draft = deepcopy(config)
     focus = 0
     while True:
-        choice, focus = _config_choice(screen, draft, detection, focus)
+        detection.refresh(draft)
+        choice, focus = _form_choice(screen, "Configure Flowvy MOTD", draft,
+                                     lambda: _config_options(draft), {}, focus,
+                                     sections={"preview": ("", "divider")},
+                                     columns={"groups", "containers", "layout"})
+        detection.refresh(draft)
         if choice in (None, "back"):
             return None
-        if choice in _CONFIG_FIELDS:
-            value = _input(screen, _CONFIG_FIELDS[choice], draft.get(choice, ""))
-            if value is not None:
-                draft[choice] = value.strip()
-                if choice == "location":
-                    detection.edited()
-        elif choice == "selection":
-            selected = _selected_ids(draft)
-            value = _picker(screen, _with_missing(items, selected), selected, "Show in MOTD")
-            if value is not None:
-                draft = _replace_selection(draft, value)
+        if choice == "host":
+            _host_details(screen, draft, detection)
         elif choice == "groups":
             _edit_groups(screen, draft, items)
+        elif choice == "containers":
+            _select_standalone(screen, draft, items, "containers")
         elif choice == "layout":
             draft["compact"] = not draft.get("compact", False)
         elif choice == "preview":
@@ -710,7 +1167,7 @@ def _edit(screen, config, items, preview, detection):
             except ValueError as error:
                 _show(screen, "Invalid settings", str(error))
                 continue
-            if not _show(screen, "MOTD preview", output):
+            if not _show(screen, "MOTD preview", output, advance=True):
                 continue
             action = _menu(screen, [("back", "Return to configuration"), ("apply", "Save settings")],
                            "Apply configuration")
