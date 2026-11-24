@@ -10,6 +10,8 @@ import re
 import subprocess
 import time
 
+from .lifecycle import read_docker_cache, remove_docker_cache, write_docker_cache
+
 
 @dataclass(frozen=True)
 class Component:
@@ -306,15 +308,19 @@ def _discover_systemd(deadline):
     return found
 
 
-def _docker(args, deadline):
-    # Use a local Unix socket even when the interactive Docker context is remote.
-    env = {key: value for key, value in os.environ.items() if key not in ("DOCKER_HOST", "DOCKER_CONTEXT")}
+def _docker_socket():
     host = os.environ.get("DOCKER_HOST", "")
     if not host.startswith("unix:///"):
         runtime = os.environ.get("XDG_RUNTIME_DIR", "")
         user_socket = os.path.join(runtime, "docker.sock") if runtime.startswith("/") else ""
         host = f"unix://{user_socket}" if user_socket and os.path.exists(user_socket) else "unix:///var/run/docker.sock"
-    return _command(["docker", "--host", host, *args], deadline, env)
+    return host
+
+
+def _docker(args, deadline):
+    # Use a local Unix socket even when the interactive Docker context is remote.
+    env = {key: value for key, value in os.environ.items() if key not in ("DOCKER_HOST", "DOCKER_CONTEXT")}
+    return _command(["docker", "--host", _docker_socket(), *args], deadline, env)
 
 
 def _json_lines(output):
@@ -432,7 +438,12 @@ def _discover_docker(deadline):
 def _collect_docker(ids, deadline):
     rows, error = _docker_list(deadline)
     if error:
-        return {selector: _unread(selector, "unavailable", error) for selector in ids}
+        cache = {}
+        if (error == "Docker access denied" and os.geteuid() != 0
+                and _docker_socket() in {"unix:///var/run/docker.sock", "unix:///run/docker.sock"}):
+            cache = read_docker_cache()
+        return {selector: _unread(selector, *cache.get(selector, ["unavailable", error]))
+                for selector in ids}
     groups = _container_selections(rows)
     by_name = {f"container:{row.name}": [row] for row in rows}
     selected = {selector: groups.get(selector, by_name.get(selector, [])) for selector in ids}
@@ -443,6 +454,18 @@ def _collect_docker(ids, deadline):
         if replicas else _unread(selector, "missing", "Container not found")
         for selector, replicas in selected.items()
     }
+
+
+def refresh_docker_cache(config):
+    selectors = list(config["containers"])
+    selectors.extend(member for app in config["applications"] for member in app["members"]
+                     if member.startswith(("compose:", "container:")))
+    if not selectors:
+        remove_docker_cache()
+        return
+    components = _collect_docker(list(dict.fromkeys(selectors)), time.monotonic() + 5)
+    write_docker_cache({selector: [component.state, component.detail]
+                        for selector, component in components.items()})
 
 
 def discover():

@@ -46,6 +46,8 @@ def run_admin(arguments):
         case ['disable']:
             lifecycle.set_hook(False)
             print('SSH greeting disabled.')
+        case ['refresh-docker']:
+            inventory.refresh_docker_cache(lifecycle.collector_settings())
         case ['update', tag]:
             lifecycle.update(expected=tag)
             print(f'Updated Flowvy MOTD to {tag}. Reopen flowvy-motd to use it.')
@@ -183,7 +185,7 @@ def menu():
             elif action == 'doctor':
                 tui.show_text('Diagnostics', _diagnostic_view())
             elif action == 'uninstall':
-                keep_config = tui.confirm_uninstall([str(path) for path in (lifecycle.BIN, lifecycle.HOOK, lifecycle.CONFIG)])
+                keep_config = tui.confirm_uninstall([str(path) for path in lifecycle.managed_paths()])
                 if keep_config is not None:
                     tui.show_text('Uninstall', admin_action(['uninstall', 'keep' if keep_config else 'remove']))
                     return

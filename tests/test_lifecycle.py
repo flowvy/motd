@@ -22,7 +22,12 @@ class LifecycleTest(unittest.TestCase):
         self.bin = base / "flowvy-motd"
         self.hook = profile / "flowvy-motd.sh"
         self.config = self.root / "flowvy-motd" / "config.toml"
-        patcher = patch.multiple(lifecycle, BIN=self.bin, HOOK=self.hook, CONFIG=self.config)
+        self.systemd = self.root / "systemd"
+        self.systemd.mkdir()
+        self.systemd_running = self.root / "systemd-running"
+        patcher = patch.multiple(lifecycle, BIN=self.bin, HOOK=self.hook, CONFIG=self.config,
+                                 SYSTEMD_DIR=self.systemd, SYSTEMD_RUNNING=self.systemd_running,
+                                 DOCKER_CACHE=self.root / "run" / "docker-status.json", create=True)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -73,6 +78,41 @@ class LifecycleTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             lifecycle.set_hook(False)
         self.assertIn("administrator", self.hook.read_text())
+
+    def test_ssh_enable_and_disable_manage_docker_collector_units(self):
+        self.systemd_running.mkdir()
+        lifecycle.install_from(self.bundle("0.1.0"))
+        with patch.object(lifecycle, "_systemctl", create=True) as systemctl:
+            lifecycle.set_hook(True)
+            self.assertTrue((self.systemd / "flowvy-motd-docker.timer").is_file())
+            self.assertTrue((self.systemd / "flowvy-motd-docker.service").is_file())
+            systemctl.assert_any_call("enable", "--now", "flowvy-motd-docker.timer")
+            lifecycle.set_hook(False)
+            systemctl.assert_any_call("disable", "--now", "flowvy-motd-docker.timer")
+            systemctl.assert_any_call("stop", "flowvy-motd-docker.service")
+        self.assertEqual(list(self.systemd.iterdir()), [])
+        self.assertFalse(self.hook.exists())
+
+    def test_enable_preserves_foreign_collector_unit(self):
+        self.systemd_running.mkdir()
+        lifecycle.install_from(self.bundle("0.1.0"))
+        foreign = self.systemd / "flowvy-motd-docker.service"
+        foreign.write_text("administrator's unit")
+        with patch.object(lifecycle, "_systemctl", create=True) as systemctl:
+            with self.assertRaises(ValueError):
+                lifecycle.set_hook(True)
+            systemctl.assert_not_called()
+        self.assertEqual(foreign.read_text(), "administrator's unit")
+        self.assertFalse(self.hook.exists())
+
+    def test_cache_expiration_and_invalid_entries_are_ignored(self):
+        contents = (b'{"format":"flowvy-motd-docker-v1","statuses":'
+                    b'{"container:ok":["healthy",""],"container:invalid":"running"}}')
+        with patch.object(lifecycle, "_cache_contents", return_value=(contents, 100)), \
+             patch.object(lifecycle.time, "time", return_value=110) as clock:
+            self.assertEqual(lifecycle.read_docker_cache(), {"container:ok": ["healthy", ""]})
+            clock.return_value = 161
+            self.assertEqual(lifecycle.read_docker_cache(), {})
 
     def test_uninstall_keeps_config_only_on_request_and_leaves_other_files(self):
         lifecycle.install_from(self.bundle("0.1.0"))

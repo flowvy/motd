@@ -151,6 +151,27 @@ class DockerInventoryTest(unittest.TestCase):
         self.assertEqual(found["container:web"].state, "unavailable")
         self.assertEqual(found["container:web"].detail, "Docker access denied")
 
+    def test_denied_system_docker_uses_only_cached_selected_components(self):
+        with patch.object(inventory, "_docker_list", return_value=([], "Docker access denied")), \
+             patch.object(inventory, "_docker_socket", return_value="unix:///var/run/docker.sock", create=True), \
+             patch.object(inventory.os, "geteuid", return_value=1000), \
+             patch.object(inventory, "read_docker_cache", create=True, return_value={
+                 "container:web": ["healthy", ""], "container:other": ["running", ""],
+             }):
+            found = inventory.collect(["container:web", "container:missing"])
+        self.assertEqual(set(found), {"container:web", "container:missing"})
+        self.assertEqual(found["container:web"].state, "healthy")
+        self.assertEqual(found["container:missing"].detail, "Docker access denied")
+
+    def test_rootless_docker_denial_does_not_use_system_snapshot(self):
+        with patch.object(inventory, "_docker_list", return_value=([], "Docker access denied")), \
+             patch.object(inventory, "_docker_socket", return_value="unix:///run/user/1000/docker.sock"), \
+             patch.object(inventory.os, "geteuid", return_value=1000), \
+             patch.object(inventory, "read_docker_cache") as cache:
+            found = inventory.collect(["container:web"])
+        cache.assert_not_called()
+        self.assertEqual(found["container:web"].state, "unavailable")
+
     def test_only_requested_sources_are_queried(self):
         with patch.object(inventory, "_systemd_query") as systemd, \
              patch.object(inventory, "_docker_list", return_value=([], "")):

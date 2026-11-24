@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -19,6 +21,9 @@ import zipfile
 BIN = Path("/usr/local/bin/flowvy-motd")
 HOOK = Path("/etc/profile.d/flowvy-motd.sh")
 CONFIG = Path("/etc/flowvy-motd/config.toml")
+SYSTEMD_DIR = Path("/etc/systemd/system")
+SYSTEMD_RUNNING = Path("/run/systemd/system")
+DOCKER_CACHE = Path("/run/flowvy-motd/docker-status.json")
 CONFIG_HEADER = b"# Managed by Flowvy MOTD\n"
 HOOK_CONTENT = b"""# Managed by Flowvy MOTD
 if [ -n "${BASH_VERSION:-}" ] && [ -n "${SSH_CONNECTION:-}" ] &&
@@ -42,6 +47,44 @@ _RELEASE_API = "https://api.github.com/repos/flowvy/motd/releases/latest"
 _VERSION = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 _SHEBANG = b"#!/usr/bin/python3\n"
 _MAX_BUNDLE_BYTES = 4 * 1024 * 1024
+_DOCKER_CACHE_PREFIX = b'{"format":"flowvy-motd-docker-v1","statuses":'
+_DOCKER_CACHE_TTL = 60
+_DOCKER_SERVICE = "flowvy-motd-docker.service"
+_DOCKER_TIMER = "flowvy-motd-docker.timer"
+_DOCKER_UNITS = {
+    _DOCKER_SERVICE: b"""# Managed by Flowvy MOTD
+[Unit]
+Description=Collect Docker statuses for Flowvy MOTD
+ConditionPathExists=/etc/flowvy-motd/config.toml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/bin/flowvy-motd --admin refresh-docker
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DOCKER_HOST=unix:///var/run/docker.sock
+RuntimeDirectory=flowvy-motd
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+TimeoutStartSec=8s
+""",
+    _DOCKER_TIMER: b"""# Managed by Flowvy MOTD
+[Unit]
+Description=Refresh Flowvy MOTD Docker statuses
+
+[Timer]
+OnActiveSec=1s
+OnCalendar=*-*-* *:*:00/20
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+""",
+}
 
 
 def _path_stat(path):
@@ -203,17 +246,136 @@ def hook_status():
     return _hook_status()
 
 
+def _systemctl(*arguments):
+    try:
+        result = subprocess.run(["/usr/bin/systemctl", *arguments], capture_output=True,
+                                text=True, errors="replace", timeout=15)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("Docker status collector setup timed out") from error
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or "Could not configure the Docker status collector")
+
+
+def _collector_files():
+    existing = {name: SYSTEMD_DIR / name for name in _DOCKER_UNITS
+                if _path_stat(SYSTEMD_DIR / name) is not None}
+    if existing:
+        _trusted_directory(SYSTEMD_DIR)
+    for name, path in existing.items():
+        info = _path_stat(path)
+        contents = _DOCKER_UNITS[name]
+        if not _safe_file(info) or info.st_size != len(contents) or path.read_bytes() != contents:
+            raise ValueError(f"Refusing to change an unmanaged Docker status unit: {path}")
+    return existing
+
+
+def _enable_docker_collector():
+    if not SYSTEMD_RUNNING.is_dir():
+        return
+    existing = _collector_files()
+    for name, contents in _DOCKER_UNITS.items():
+        if name not in existing:
+            _atomic_write(SYSTEMD_DIR / name, contents, 0o644)
+    _systemctl("enable", "--now", _DOCKER_TIMER)
+
+
+def _disable_docker_collector():
+    existing = _collector_files()
+    if existing and SYSTEMD_RUNNING.is_dir():
+        if _DOCKER_TIMER in existing:
+            _systemctl("disable", "--now", _DOCKER_TIMER)
+        if _DOCKER_SERVICE in existing:
+            _systemctl("stop", _DOCKER_SERVICE)
+    elif _DOCKER_TIMER in existing:
+        # Also remove the timer's enablement symlink on an offline system.
+        _systemctl("--no-reload", "disable", _DOCKER_TIMER)
+    for path in existing.values():
+        path.unlink()
+    if existing and SYSTEMD_RUNNING.is_dir():
+        _systemctl("daemon-reload")
+    remove_docker_cache()
+
+
+def managed_paths():
+    return (BIN, HOOK, CONFIG, *(SYSTEMD_DIR / name for name in _DOCKER_UNITS), DOCKER_CACHE)
+
+
+def _cache_contents():
+    _trusted_directory(DOCKER_CACHE.parent)
+    fd = os.open(DOCKER_CACHE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as file:
+        info = os.fstat(file.fileno())
+        if info.st_uid != 0 or not _safe_file(info):
+            raise ValueError(f"Unsafe Docker status cache: {DOCKER_CACHE}")
+        contents = file.read(_MAX_BUNDLE_BYTES + 1)
+    if len(contents) > _MAX_BUNDLE_BYTES or not contents.startswith(_DOCKER_CACHE_PREFIX):
+        raise ValueError(f"Unmanaged Docker status cache: {DOCKER_CACHE}")
+    return contents, info.st_mtime
+
+
+def read_docker_cache():
+    """Return statuses only while the root-owned snapshot is fresh."""
+    try:
+        contents, timestamp = _cache_contents()
+        if 0 <= time.time() - timestamp <= _DOCKER_CACHE_TTL:
+            statuses = json.loads(contents)["statuses"]
+            if isinstance(statuses, dict):
+                return {selector: entry for selector, entry in statuses.items()
+                        if isinstance(entry, list) and len(entry) == 2
+                        and all(isinstance(value, str) for value in entry)}
+    except (OSError, ValueError, KeyError):
+        pass
+    return {}
+
+
+def write_docker_cache(statuses):
+    try:
+        _cache_contents()
+    except FileNotFoundError:
+        pass
+    payload = json.dumps(statuses, separators=(",", ":")).encode()
+    _atomic_write(DOCKER_CACHE, _DOCKER_CACHE_PREFIX + payload + b"}\n", 0o644)
+
+
+def remove_docker_cache():
+    try:
+        _cache_contents()
+    except FileNotFoundError:
+        return
+    DOCKER_CACHE.unlink()
+    try:
+        DOCKER_CACHE.parent.rmdir()
+    except OSError as error:
+        if error.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY):
+            raise
+
+
+def collector_settings():
+    from .settings import load
+
+    info = _path_stat(CONFIG)
+    if info is not None:
+        _trusted_directory(CONFIG.parent)
+        if not _safe_file(info):
+            raise ValueError(f"Unsafe collector settings: {CONFIG}")
+    return load(CONFIG)
+
+
 def set_hook(enabled):
     with _serialized():
         status = _hook_status()
         if status == "modified":
             raise ValueError(f"Refusing to change an existing unmanaged hook: {HOOK}")
-        if enabled and status != "enabled":
+        if enabled:
             if not _owned_binary():
                 raise ValueError("Install Flowvy MOTD before enabling the SSH greeting")
-            _atomic_write(HOOK, HOOK_CONTENT, 0o644)
-        if not enabled and status == "enabled":
-            HOOK.unlink()
+            _enable_docker_collector()
+            if status != "enabled":
+                _atomic_write(HOOK, HOOK_CONTENT, 0o644)
+        else:
+            _disable_docker_collector()
+            if status == "enabled":
+                HOOK.unlink()
 
 
 def _download(url, *, limit=_MAX_BUNDLE_BYTES):
@@ -293,6 +455,7 @@ def uninstall(keep_config):
     """Remove managed files only. Return paths preserved as ownership conflicts."""
     preserved = []
     with _serialized():
+        _disable_docker_collector()
         status = _hook_status()
         if status == "enabled":
             HOOK.unlink()

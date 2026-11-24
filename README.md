@@ -5,7 +5,7 @@ A terminal dashboard for interactive Bash SSH sessions on Debian 13. It shows ho
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/flowvy/motd/v0.1.10/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/flowvy/motd/v0.1.11/install.sh | sh
 ```
 
 The installer requires Python 3.11 or newer. It downloads the latest stable GitHub release and checks its SHA-256 checksum before installing the executable. It uses `sudo` when run by a regular account, or installs directly when run as root. The SSH greeting is initially off. CPU usage is sampled from Linux kernel counters. Docker and NetBird are optional.
@@ -20,17 +20,23 @@ If **Location** is blank when you open configuration, Flowvy detects the locatio
 
 Open **Service groups** to create a group, name it, and choose its services in one flow. **Containers** has its own picker. In either list, press **/** to filter in place, **Space** to toggle an item, and **Enter** to keep the selection in the draft. Search matches service names, descriptions, and known Debian packages, or container names, images, and Compose projects. Compose selections use the project and service labels, so they survive container replacement.
 
-Groups combine chosen services into a row. You can nominate a primary service and optionally check a local HTTP endpoint, such as `http://127.0.0.1:8080/health`. A passing application check and a failed helper produce a warning. Without a functional check, the dashboard reports observed component states. Idle scheduled services and completed one-shot jobs are treated separately from failures. The dashboard reads a snapshot on demand and retains no log or status history of its own.
+Groups combine chosen services into a row. You can nominate a primary service and optionally check a local HTTP endpoint, such as `http://127.0.0.1:8080/health`. A passing application check and a failed helper produce a warning. Without a functional check, the dashboard reports observed component states. Idle scheduled services and completed one-shot jobs are treated separately from failures.
+
+When the SSH greeting is enabled on a systemd host, a timer collects the selected system Docker statuses every 20 seconds. SSH users with no access to the system Docker socket can read the latest snapshot for up to 60 seconds. The snapshot contains the selected identifiers, states, and brief status details. Flowvy retains no status history.
 
 ## Update, disable, or uninstall
 
 Use **Check for updates** to see the installed and available versions. Confirming the update replaces the executable after verification and retains your settings. Use **Disable SSH greeting** to turn off automatic display while keeping the dashboard available.
+
+If you upgraded from a version that predates the Docker status timer and already had the SSH greeting enabled, run `sudo flowvy-motd --admin enable` once after updating to provision the timer.
 
 Use **Uninstall Flowvy MOTD** to review the file paths and decide whether to keep settings. Flowvy manages these paths:
 
 - `/usr/local/bin/flowvy-motd` for the executable.
 - `/etc/flowvy-motd/config.toml` for settings, after the first save.
 - `/etc/profile.d/flowvy-motd.sh` for the optional SSH greeting.
+- `/etc/systemd/system/flowvy-motd-docker.service` and `flowvy-motd-docker.timer` for the optional Docker status collector.
+- `/run/flowvy-motd/docker-status.json` for the temporary snapshot.
 
 Uninstall checks file ownership and preserves a foreign or edited hook, which it reports by path. The OS login configuration, PAM, SSH daemon, `.hushlogin`, and installed dependencies are outside the installer's file list. You can review the local configuration and integration via **Diagnostics**.
 
