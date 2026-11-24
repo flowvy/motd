@@ -1,30 +1,52 @@
 # Flowvy MOTD
 
-A dynamic SSH login dashboard for Debian 13, powered by Fastfetch.
+A terminal dashboard for interactive Bash SSH sessions on Debian 13. It shows host metrics, network details, and the status of the services, containers, and application groups you select.
 
-## Installation
+## Install
 
-Run as root in an interactive terminal. Python 3 and curl are required. The installer offers to install Fastfetch via APT if missing.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/flowvy/motd/main/install.py -o /root/flowvy-motd-install.py && python3 /root/flowvy-motd-install.py
+```sh
+curl -fsSL https://raw.githubusercontent.com/flowvy/motd/v0.1.0/install.sh | sh
 ```
 
-Review the installer before running it on production systems.
+The installer requires Python 3.11 or newer. It downloads the latest stable GitHub release and checks its SHA-256 checksum before installing the executable. It uses `sudo` when run by a regular account, or installs directly when run as root. The SSH greeting is initially off. Existing Fastfetch installations provide additional CPU metrics. Docker and NetBird are optional.
 
-## Commands
+Run `flowvy-motd` to open the English menu. Select **Configure appearance and services**, preview your choices, and then select **Enable SSH greeting**. The greeting applies to interactive Bash SSH logins. The menu also opens the dashboard on demand, checks for releases, displays diagnostics, and handles removal.
 
-| Command | Description |
-| --- | --- |
-| `motd` | Display a fresh server status snapshot. |
-| `motd-config` | Edit settings, preview, or uninstall (root required). |
+## Select what appears
 
-Configure provider, role, location, monitored systemd services and Docker containers interactively. IP geolocation is optional and performed only during configuration. No background daemon or external HTTP request is required at SSH login.
+In the picker, **Tab** switches between services and containers, **/** searches across both, and **Space** toggles a selection. Search matches the systemd name, description, and Debian package when available, or the container name, image, and Compose project. Compose selections use the project and service labels, so they survive container replacement.
 
-## Uninstall
+Application groups combine chosen components into a row. You can nominate a primary component and optionally check a local HTTP endpoint, such as `http://127.0.0.1:8080/health`. A passing application check and a failed helper produce a warning. Without a functional check, the dashboard reports observed component states. Idle scheduled services and completed one-shot jobs are treated separately from failures. The dashboard reads a snapshot on demand and retains no log or status history of its own.
 
-Run `motd-config`, select **Uninstall**, and confirm with `REMOVE`. This removes the installed dashboard, configuration, backups, managed commands and SSH profile hook. System packages and services remain installed. A pre-existing `.hushlogin` is preserved.
+## Update, disable, or uninstall
 
-## Compatibility
+Use **Check for updates** to see the installed and available versions. Confirming the update replaces the executable after verification and retains your settings. Use **Disable SSH greeting** to turn off automatic display while keeping the dashboard available.
 
-Target: Debian 13, Bash SSH login sessions, Fastfetch 2.40.4. Docker and NetBird are optional. Container information requires permission to query Docker. Integration testing on Debian 13 is pending.
+Use **Uninstall Flowvy MOTD** to review the file paths and decide whether to keep settings. Flowvy manages these paths:
+
+- `/usr/local/bin/flowvy-motd` for the executable.
+- `/etc/flowvy-motd/config.toml` for settings, after the first save.
+- `/etc/profile.d/flowvy-motd.sh` for the optional SSH greeting.
+
+Uninstall checks file ownership and preserves a foreign or edited hook, which it reports by path. The OS login configuration, PAM, SSH daemon, `.hushlogin`, and installed dependencies are outside the installer's file list. You can review the local configuration and integration via **Diagnostics**.
+
+## Remove the previous script installation
+
+Run the previous version's menu from an interactive terminal:
+
+```sh
+sudo /usr/local/bin/motd-config
+```
+
+Select **3. Uninstall**, then type `REMOVE`. The old uninstaller deletes `/etc/flowvy-motd`, including the settings and backups. Copy any settings or backups you want to retain to another location first. If the old wrapper is missing, use `sudo /usr/bin/python3 /etc/flowvy-motd/installer.py --config`. Do this before installing the current release.
+
+To import a saved copy once the new version is installed, run `flowvy-motd --import-legacy /path/to/settings.json`, preview it, and confirm.
+
+## Build and test
+
+```sh
+PYTHONPATH=src python3 -m unittest discover -s tests
+python3 scripts/build-release.py
+```
+
+The second command writes the executable archive and checksum to `dist/`.
