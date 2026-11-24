@@ -96,7 +96,7 @@ def _diagnostic_sections():
     except SettingsError as error:
         installation.append(f'Settings: {error}')
     tools = [f'{name}: {shutil.which(name) or "not found"}'
-             for name in ('systemctl', 'fastfetch', 'ip', 'docker', 'netbird')]
+             for name in ('systemctl', 'ip', 'docker', 'netbird')]
     return [('Installation', installation), ('Selection', selection), ('Issues', issues), ('Tools', tools)]
 
 

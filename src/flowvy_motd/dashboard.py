@@ -208,6 +208,7 @@ def render_dashboard(config, metrics, network, components, probes, *, width=80, 
             if component.state in {'waiting', 'completed'}:
                 continue
             tone, value = describe(component)
+            detail_text = component.detail
             if component.id == 'unit:netbird.service' and NETBIRD_CONNECTION in probes:
                 state, reason = probes[NETBIRD_CONNECTION]
                 if state == 'connected':
@@ -218,11 +219,12 @@ def render_dashboard(config, metrics, network, components, probes, *, width=80, 
                     tone, value = 'warn', 'Disconnected'
                 elif component.state in {'running', 'healthy'}:
                     tone, value = 'warn', 'Connection not checked'
+                    detail_text = reason or detail_text
             label = component.name
             if component.id.startswith('unit:'):
                 label = labels.get(component.id.removeprefix('unit:'), label)
             status(label, tone, value)
-            if not compact and component.detail and tone in {'warn', 'bad'}:
-                detail(component.detail)
+            if not compact and detail_text and tone in {'warn', 'bad'}:
+                detail(detail_text)
 
     return '\n'.join(lines) + '\n'

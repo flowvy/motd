@@ -21,6 +21,14 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(any('Mesh VPN' in line and 'Disconnected' in line for line in text.splitlines()))
         self.assertNotIn('netbird.service', text)
 
+    def test_netbird_unavailable_check_shows_its_reason(self):
+        netbird = Component('unit:netbird.service', 'netbird.service', state='running')
+        text = render_dashboard({'services': ['netbird.service']}, {}, {}, {netbird.id: netbird},
+                                {NETBIRD_CONNECTION: ('unavailable', 'NetBird access denied')},
+                                color=False)
+        self.assertIn('Connection not checked', text)
+        self.assertIn('NetBird access denied', text)
+
     def test_confirmed_main_function_and_failed_helper(self):
         tone, status, details = app_status(self.app, self.components, ('ok', 'HTTP 200'))
         self.assertEqual((tone, status), ('warn', 'Available with warnings'))

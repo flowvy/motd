@@ -14,7 +14,9 @@ import time
 from . import inventory
 from .settings import probe_target
 
-LOGIN_BUDGET = 0.62
+# Leave time for startup and rendering within the SSH hook's two-second cap.
+LOGIN_BUDGET = 1.7
+CPU_SAMPLE_INTERVAL = 0.15
 NETBIRD_CONNECTION = object()
 
 
@@ -77,27 +79,43 @@ def native_metrics():
     cores = len(os.sched_getaffinity(0))
     cpu = next((line.partition(':')[2].strip() for line in read_file('/proc/cpuinfo').splitlines()
                 if line.startswith(('model name', 'Hardware')) and ':' in line), '')
-    fields['cpu'] = ' · '.join(filter(None, (cpu, f'{cores} logical CPUs')))
+    cpu_label = 'CPU' if cores == 1 else 'CPUs'
+    fields['cpu'] = ' · '.join(filter(None, (cpu, f'{cores} logical {cpu_label}')))
     return fields
 
 
-def fast_metrics(deadline):
-    data = local_command(
-        ['fastfetch', '--config', 'none', '--format', 'json', '--structure', 'CPU:CPUUsage'],
-        min(deadline, time.monotonic() + 0.31),
-    )
-    try:
-        results = {item['type']: item.get('result') for item in json.loads(data or '[]')}
-        cpu = results.get('CPU') or {}
-        usage = results.get('CPUUsage') or []
-        name = cpu.get('cpu')
-        logical = cpu.get('cores', {}).get('logical')
-        percent = f'{sum(usage) / len(usage):.0f}%' if usage else ''
-        if name and logical:
-            return ' · '.join(filter(None, (name, f'{logical} logical CPUs', percent)))
-    except (TypeError, ValueError, KeyError, AttributeError):
-        pass
-    return ''
+def cpu_times(cpus):
+    totals = [0] * 8
+    seen = set()
+    for row in read_file('/proc/stat').splitlines():
+        fields = row.split()
+        if not fields or fields[0] not in cpus:
+            continue
+        if len(fields) < 9:
+            return None
+        # guest and guest_nice are already counted in user and nice.
+        totals = [total + int(field) for total, field in zip(totals, fields[1:9])]
+        seen.add(fields[0])
+    return totals if seen == cpus else None
+
+
+def cpu_usage(deadline):
+    if deadline - time.monotonic() < CPU_SAMPLE_INTERVAL:
+        return None
+    cpus = {f'cpu{cpu}' for cpu in os.sched_getaffinity(0)}
+    before = cpu_times(cpus)
+    if before is None:
+        return None
+    time.sleep(CPU_SAMPLE_INTERVAL)
+    after = cpu_times(cpus)
+    if after is None:
+        return None
+    deltas = [end - start for start, end in zip(before, after)]
+    elapsed = sum(deltas)
+    if elapsed <= 0 or min(deltas) < 0:
+        return None
+    busy = elapsed - deltas[3] - deltas[4] - deltas[7]
+    return round(100 * busy / elapsed)
 
 
 def network_metrics(deadline):
@@ -152,22 +170,25 @@ def http_check(url, deadline):
 
 def snapshot(config, timeout=LOGIN_BUDGET):
     deadline = time.monotonic() + timeout
+    # Allow command timeouts to be converted into results before the snapshot ends.
+    command_deadline = deadline - min(0.1, timeout / 5)
     applications = config['applications']
     ids = [f'unit:{unit}' for unit in config['services']] + config['containers']
     ids.extend(member for group in applications for member in group['members'])
     ids = list(dict.fromkeys(ids))
-    with_budget = max(0.01, deadline - time.monotonic())
 
     workers = ThreadPoolExecutor(max_workers=6)
-    component_task = workers.submit(inventory.collect, ids, timeout=with_budget)
-    network_task = workers.submit(network_metrics, deadline)
-    fast_task = workers.submit(fast_metrics, deadline)
-    checks = {group['name']: workers.submit(http_check, group['check_url'], deadline)
-              for group in applications if group['check_url']}
+    component_tasks = inventory.submit_collection(workers, ids, command_deadline)
+    network_task = workers.submit(network_metrics, command_deadline)
+    cpu_task = workers.submit(cpu_usage, command_deadline)
+    checks = {}
     if 'unit:netbird.service' in ids:
-        checks[NETBIRD_CONNECTION] = workers.submit(inventory.read_netbird, min(with_budget, 0.25))
+        checks[NETBIRD_CONNECTION] = workers.submit(
+            inventory.read_netbird, max(0, command_deadline - time.monotonic()))
+    checks.update({group['name']: workers.submit(http_check, group['check_url'], command_deadline)
+                   for group in applications if group['check_url']})
     metrics = native_metrics()
-    wait([component_task, network_task, fast_task, *checks.values()],
+    wait([*component_tasks, network_task, cpu_task, *checks.values()],
          timeout=max(0, deadline - time.monotonic()))
     workers.shutdown(wait=False, cancel_futures=True)
 
@@ -179,10 +200,12 @@ def snapshot(config, timeout=LOGIN_BUDGET):
                 pass
         return fallback
 
-    cpu = result(fast_task, '')
-    if cpu:
-        metrics['cpu'] = cpu
-    components = result(component_task, {})
+    cpu = result(cpu_task, None)
+    if cpu is not None:
+        metrics['cpu'] += f' · {cpu}%'
+    components = {}
+    for task in component_tasks:
+        components.update(result(task, {}))
     for item in ids:
         if item not in components:
             components[item] = inventory.Component(item, item.partition(':')[2], state='unavailable',

@@ -455,20 +455,25 @@ def discover():
     return sorted(components, key=lambda item: (item.source, item.group, item.name))
 
 
-def collect(ids, *, timeout=0.65):
-    """Read selected component states in a single shared time budget."""
-    deadline = time.monotonic() + timeout
+def submit_collection(executor, ids, deadline):
+    """Submit independent providers so callers can keep results as they finish."""
     selectors = list(dict.fromkeys(ids))
     unit_ids = [item for item in selectors if item.startswith("unit:")]
     docker_ids = [item for item in selectors if item.startswith(("compose:", "container:"))]
+    work = []
+    if unit_ids:
+        work.append(executor.submit(_collect_systemd, unit_ids, deadline))
+    if docker_ids:
+        work.append(executor.submit(_collect_docker, docker_ids, deadline))
+    return work
+
+
+def collect(ids, *, timeout=0.65):
+    """Read selected component states in a single shared time budget."""
+    deadline = time.monotonic() + timeout
     found = {}
     with ThreadPoolExecutor(max_workers=2) as threads:
-        work = []
-        if unit_ids:
-            work.append(threads.submit(_collect_systemd, unit_ids, deadline))
-        if docker_ids:
-            work.append(threads.submit(_collect_docker, docker_ids, deadline))
-        for future in work:
+        for future in submit_collection(threads, ids, deadline):
             found.update(future.result())
     return found
 
