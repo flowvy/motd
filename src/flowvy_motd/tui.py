@@ -9,6 +9,8 @@ import sys
 import textwrap
 from typing import TYPE_CHECKING
 
+from .dashboard import char_width
+
 if TYPE_CHECKING:
     from .inventory import Component
 
@@ -19,6 +21,12 @@ _ENTER = ("\n", "\r", curses.KEY_ENTER)
 _BACKSPACE = ("\b", "\x7f", curses.KEY_BACKSPACE)
 _SOURCES = ("systemd", "docker")
 _GROUP_KIND = {"package": "package", "compose": "Compose"}
+_CONFIG_FIELDS = {"provider": "Provider", "role": "Server role", "location": "Location"}
+_LOCATION_NOTES = {
+    "pending": "Detecting location…",
+    "detected": "Auto-detected from this server’s public IP",
+    "unavailable": "Could not detect location. Enter it manually.",
+}
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
 _STATE_LABELS = {
     "running": "Running",
@@ -98,8 +106,16 @@ class _Terminal:
             except curses.error:
                 pass
 
-    def key(self):
-        return self.window.get_wch()
+    def key(self, timeout=None):
+        if timeout is None:
+            return self.window.get_wch()
+        self.window.timeout(timeout)
+        try:
+            return self.window.get_wch()
+        except curses.error:
+            return None
+        finally:
+            self.window.timeout(-1)
 
 
 def _run(action):
@@ -522,28 +538,163 @@ def _edit_groups(screen, draft, items):
             groups.append(result)
 
 
-def _edit(screen, config, items, preview):
-    draft = deepcopy(config)
+class _LocationDetection:
+    def __init__(self, has_location, factory):
+        self.lookup = None
+        self.state = ""
+        self.value = ""
+        if not has_location:
+            if factory is None:
+                from .location import LocationLookup
+
+                factory = LocationLookup
+            self.lookup = factory()
+            if self.lookup is not None:
+                self.state = "pending"
+
+    @property
+    def note(self):
+        return _LOCATION_NOTES.get(self.state, "")
+
+    def refresh(self, draft):
+        if self.lookup is not None:
+            self.state, self.value = self.lookup.poll()
+            if self.state != "pending":
+                self.lookup = None
+        if self.state == "detected" and not draft.get("location"):
+            draft["location"] = self.value
+
+    def edited(self):
+        self.lookup = None
+        self.state = ""
+
+
+class _InlineField:
+    def __init__(self, value):
+        self.value = value
+        self.cursor = len(value)
+        self.modified = False
+
+    def key(self, key):
+        index = self.cursor
+        value = self.value
+        if key == curses.KEY_LEFT:
+            self.cursor = max(0, index - 1)
+        elif key == curses.KEY_RIGHT:
+            self.cursor = min(len(value), index + 1)
+        elif key == curses.KEY_HOME:
+            self.cursor = 0
+        elif key == curses.KEY_END:
+            self.cursor = len(value)
+        elif key == curses.KEY_DC:
+            self.value = value[:index] + value[index + 1:]
+        elif key in _BACKSPACE and index:
+            self.cursor -= 1
+            self.value = value[:self.cursor] + value[index:]
+        elif key == "\x15":
+            self.value = ""
+            self.cursor = 0
+        elif isinstance(key, str) and key.isprintable() and len(value) < 160:
+            self.value = value[:index] + key + value[index:]
+            self.cursor += 1
+        self.modified = self.modified or self.value != value or key == "\x15"
+
+    def row(self, label, width):
+        limit = max(1, width - 3)
+        prefix = f"{label}  ·  "
+        if limit < len(prefix) + 3:
+            prefix = label[:max(0, limit - 4)] + " "
+        remaining = max(0, limit - len(prefix) - 3)
+        left = []
+        for char in reversed(self.value[:self.cursor]):
+            remaining -= char_width(char)
+            if remaining < 0:
+                remaining = 0
+                break
+            left.append(char)
+        right = []
+        for char in self.value[self.cursor:]:
+            remaining -= char_width(char)
+            if remaining < 0:
+                break
+            right.append(char)
+        return prefix + "[" + "".join(reversed(left)) + "▌" + "".join(right) + "]"
+
+
+def _config_options(draft):
+    style = "Compact" if draft.get("compact") else "Automatic"
+    return [
+        *((field, f"{label}  ·  {draft.get(field) or 'Not set'}") for field, label in _CONFIG_FIELDS.items()),
+        ("selection", f"Services and containers  ·  {len(_selected_ids(draft))} selected"),
+        ("groups", f"Application groups  ·  {len(draft.get('applications', []))}"),
+        ("layout", f"Display  ·  {style}"),
+        ("preview", "Preview and apply"),
+        ("back", "Cancel"),
+    ]
+
+
+def _config_choice(screen, draft, detection, index):
+    title = "Configure Flowvy MOTD"
+    if screen is None:
+        detection.refresh(draft)
+        choice = _plain_menu(_config_options(draft), title, detection.note)
+        detection.refresh(draft)
+        return choice, index
+
+    editor = None
     while True:
-        style = "Compact" if draft.get("compact") else "Automatic"
-        options = [
-            ("provider", f"Provider  ·  {draft.get('provider') or 'Not set'}"),
-            ("role", f"Server role  ·  {draft.get('role') or 'Not set'}"),
-            ("location", f"Location  ·  {draft.get('location') or 'Not set'}"),
-            ("selection", f"Services and containers  ·  {len(_selected_ids(draft))} selected"),
-            ("groups", f"Application groups  ·  {len(draft.get('applications', []))}"),
-            ("layout", f"Display  ·  {style}"),
-            ("preview", "Preview and apply"),
-            ("back", "Cancel"),
-        ]
-        choice = _menu(screen, options, "Configure Flowvy MOTD")
+        detection.refresh(draft)
+        options = _config_options(draft)
+        choice = options[index][0]
+        rows = [(label, "plain") for _, label in options]
+        subtitle = detection.note
+        if editor is None:
+            hint = "↑ ↓ Move   Enter Select   Esc Back"
+        else:
+            if choice == "location":
+                if editor.modified:
+                    subtitle = ""
+                elif not editor.value and draft.get("location"):
+                    editor = _InlineField(draft["location"])
+            _, width = screen.size()
+            rows[index] = (editor.row(_CONFIG_FIELDS[choice], width), "plain")
+            hint = "← → Cursor   Enter Apply   Esc Cancel   Ctrl-U Clear"
+        screen.paint(title, subtitle, rows, index, hint)
+        key = screen.key(timeout=100) if detection.lookup is not None else screen.key()
+        if editor is not None:
+            if key in _ENTER:
+                if choice != "location" or editor.modified:
+                    draft[choice] = editor.value.strip()
+                    if choice == "location":
+                        detection.edited()
+                editor = None
+            elif key == "\x1b":
+                editor = None
+            else:
+                editor.key(key)
+        elif key == "\x1b":
+            return None, index
+        elif key in _ENTER:
+            if choice not in _CONFIG_FIELDS:
+                return choice, index
+            editor = _InlineField(draft.get(choice, ""))
+        else:
+            index = _navigate(key, index, len(options))
+
+
+def _edit(screen, config, items, preview, detection):
+    draft = deepcopy(config)
+    focus = 0
+    while True:
+        choice, focus = _config_choice(screen, draft, detection, focus)
         if choice in (None, "back"):
             return None
-        if choice in ("provider", "role", "location"):
-            title = "Server role" if choice == "role" else choice.capitalize()
-            value = _input(screen, title, draft.get(choice, ""))
+        if choice in _CONFIG_FIELDS:
+            value = _input(screen, _CONFIG_FIELDS[choice], draft.get(choice, ""))
             if value is not None:
                 draft[choice] = value.strip()
+                if choice == "location":
+                    detection.edited()
         elif choice == "selection":
             selected = _selected_ids(draft)
             value = _picker(screen, _with_missing(items, selected), selected, "Show in MOTD")
@@ -567,5 +718,6 @@ def _edit(screen, config, items, preview):
                 return draft
 
 
-def edit_config(config: dict, items: list["Component"], preview: Callable[[dict], str]) -> dict | None:
-    return _run(lambda screen: _edit(screen, config, items, preview))
+def edit_config(config: dict, items: list["Component"], preview: Callable[[dict], str], *, lookup_factory=None) -> dict | None:
+    detection = _LocationDetection(bool(config.get("location")), lookup_factory)
+    return _run(lambda screen: _edit(screen, config, items, preview, detection))
