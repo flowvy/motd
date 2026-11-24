@@ -18,7 +18,7 @@ COLORS = {
 }
 RESET = '\033[0m'
 STATUS = {
-    'running': ('ok', 'Running'), 'healthy': ('ok', 'Health check passed'),
+    'running': ('ok', 'Running'), 'healthy': ('ok', 'Healthy'),
     'waiting': ('muted', 'Waiting'), 'completed': ('muted', 'Completed'),
     'failed': ('bad', 'Failed'), 'stopped': ('warn', 'Stopped'),
     'starting': ('warn', 'Starting'), 'stopping': ('warn', 'Stopping'),
