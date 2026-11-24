@@ -7,6 +7,49 @@ from flowvy_motd.settings import load, normalize, read_legacy, save, token, Sett
 
 
 class SettingsTests(unittest.TestCase):
+    def test_service_display_names_round_trip_only_for_selected_units(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.toml'
+            data = {'services': ['web-worker.service', 'ssh.service'], 'service_labels': {
+                'web-worker.service': '  Worker "EU" 🐦  ',
+                'ssh.service': '',
+                'inactive.service': 'Inactive service',
+            }}
+            save(path, data)
+            self.assertEqual(load(path)['service_labels'], {'web-worker.service': 'Worker "EU" 🐦'})
+            save(path, {'services': data['services']})
+            self.assertNotIn('service_labels', load(path))
+            self.assertNotIn('[service_labels]', path.read_text())
+
+    def test_service_display_names_validate_table_keys_and_values(self):
+        for labels in (['Remote access'], {'ssh.service': 17}, {'ssh.service': 'two\nlines'},
+                       {'ssh.service': 'x' * 65}, {'sub/ssh.service': 'SSH'}):
+            with self.subTest(labels=labels), self.assertRaises(SettingsError):
+                normalize({'services': ['ssh.service'], 'service_labels': labels})
+
+    def test_round_trip_with_hyphenated_systemd_services(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'flowvy-motd' / 'config.toml'
+            data = {
+                'services': ['data-refresh.service', r'\x2dcheck.service'],
+                'applications': [{
+                    'name': 'Worker',
+                    'members': ['unit:service-worker@eu-west.service', 'unit:cert-refresh.service'],
+                    'primary': 'unit:service-worker@eu-west.service',
+                }],
+            }
+            save(path, data)
+            config = load(path)
+            self.assertEqual(config['services'], data['services'])
+            for field, value in data['applications'][0].items():
+                self.assertEqual(config['applications'][0][field], value)
+
+    def test_systemd_service_names_reject_path_separators(self):
+        with self.assertRaises(SettingsError):
+            normalize({'services': ['subdir/worker.service']})
+        with self.assertRaises(SettingsError):
+            normalize({'applications': [{'name': 'Worker', 'members': ['unit:subdir/worker.service']}]})
+
     def test_round_trip_and_reject_concurrent_edits(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'flowvy-motd' / 'config.toml'

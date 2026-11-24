@@ -192,6 +192,7 @@ def render_dashboard(config, metrics, network, components, probes, *, width=80, 
         ('SERVICES', [f'unit:{unit}' for unit in config.get('services', [])]),
         ('CONTAINERS', config.get('containers', [])),
     )
+    labels = config.get('service_labels', {})
     for title, ids in mapping:
         ungrouped = [components[item] for item in ids if item not in grouped and item in components]
         if not ungrouped:
@@ -211,7 +212,10 @@ def render_dashboard(config, metrics, network, components, probes, *, width=80, 
                     tone, value = 'warn', 'Disconnected'
                 elif component.state in {'running', 'healthy'}:
                     tone, value = 'warn', 'Connection not checked'
-            status(component.name, tone, value)
+            label = component.name
+            if component.id.startswith('unit:'):
+                label = labels.get(component.id.removeprefix('unit:'), label)
+            status(label, tone, value)
             if not compact and component.detail and tone in {'warn', 'bad'}:
                 detail(component.detail)
 

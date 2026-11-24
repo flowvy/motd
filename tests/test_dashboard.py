@@ -2,6 +2,7 @@ import unittest
 
 from flowvy_motd.dashboard import app_status, render_dashboard
 from flowvy_motd.inventory import Component
+from flowvy_motd.snapshot import NETBIRD_CONNECTION
 
 
 class DashboardTests(unittest.TestCase):
@@ -11,6 +12,14 @@ class DashboardTests(unittest.TestCase):
         self.components = {component.id: component for component in (web, update)}
         self.app = {'name': 'Web app', 'members': list(self.components), 'primary': web.id,
                     'check_url': 'http://127.0.0.1:8080/health'}
+
+    def test_service_display_name_preserves_netbird_connection_status(self):
+        netbird = Component('unit:netbird.service', 'netbird.service', source='systemd', state='running')
+        settings = {'services': ['netbird.service'], 'service_labels': {'netbird.service': 'Mesh VPN'}}
+        text = render_dashboard(settings, {}, {}, {netbird.id: netbird},
+                                {NETBIRD_CONNECTION: ('disconnected', '')}, color=False)
+        self.assertTrue(any('Mesh VPN' in line and 'Disconnected' in line for line in text.splitlines()))
+        self.assertNotIn('netbird.service', text)
 
     def test_confirmed_main_function_and_failed_helper(self):
         tone, status, details = app_status(self.app, self.components, ('ok', 'HTTP 200'))

@@ -399,6 +399,37 @@ class ScopedConfigurationTests(unittest.TestCase):
         self.assertNotIn("ssh.service", str(frames))
         self.assertIn("[x] cron.service", str(frames))
 
+    def test_rename_standalone_service_and_filter_by_display_name(self):
+        draft = {"services": ["ssh.service"]}
+        screen = ScriptedTerminal(["r", *"Remote shell", "\n", "/", *"Remote shell", "\n", "\n"])
+        tui._select_standalone(screen, draft, self.items, "services")
+        self.assertEqual(draft, {"services": ["ssh.service"], "service_labels": {"ssh.service": "Remote shell"}})
+        self.assertIn("ssh.service", str(next(frame for frame in screen.frames if frame[0] == "Rename service")))
+        self.assertIn("1 shown", screen.frames[-1][1])
+
+    def test_service_display_name_can_be_reset_or_discarded(self):
+        for finish, expected in (("\x1b", {"ssh.service": "Remote shell"}), ("\n", {})):
+            with self.subTest(finish=finish):
+                draft = {"services": ["ssh.service"], "service_labels": {"ssh.service": "Remote shell"}}
+                screen = ScriptedTerminal(["r", "\x15", "\n", finish])
+                tui._select_standalone(screen, draft, self.items, "services")
+                self.assertEqual(draft.get("service_labels", {}), expected)
+
+    def test_renaming_a_service_keeps_it_focused_when_the_filter_no_longer_matches(self):
+        draft = {"services": ["ssh.service"], "service_labels": {"ssh.service": "Remote shell"}}
+        screen = ScriptedTerminal(["/", *"Remote", "\n", "r", "\x15", *"Maintenance", "\n", "\n"])
+        tui._select_standalone(screen, draft, self.items, "services")
+        self.assertEqual(draft["service_labels"], {"ssh.service": "Maintenance"})
+        self.assertIn("[x] ssh.service", str(screen.frames[-1]))
+
+    @patch("builtins.input", side_effect=["3", "1", "Remote shell", "4"])
+    def test_plain_standalone_services_can_be_renamed(self, read):
+        draft = {"services": ["ssh.service"]}
+        with patch.object(tui.sys, "stdout", io.StringIO()) as output:
+            tui._select_standalone(None, draft, self.items, "services")
+        self.assertEqual(draft["service_labels"], {"ssh.service": "Remote shell"})
+        self.assertIn("Rename service › ssh.service › Display name", output.getvalue())
+
     def test_removing_only_the_group_keeps_monitored_members(self):
         groups = [
             {"name": "Legacy", "members": [self.ssh.id, self.dashboard.id, self.cache.id],

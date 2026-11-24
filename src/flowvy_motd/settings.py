@@ -13,11 +13,12 @@ from urllib.parse import urlsplit
 
 MARKER = '# Managed by Flowvy MOTD'
 MAX_BYTES = 256 * 1024
+SERVICE_LABEL_LIMIT = 64
 DEFAULTS = {
     'provider': '', 'role': '', 'location': '', 'compact': False,
-    'services': [], 'containers': [], 'applications': [],
+    'services': [], 'containers': [], 'applications': [], 'service_labels': {},
 }
-UNIT = re.compile(r'[\w:.-][\w:.-@\\]*\.service\Z', re.ASCII)
+UNIT = re.compile(r'[-\w:.\\][-\w:.@\\]*\.service\Z', re.ASCII)
 DOCKER_NAME = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*\Z')
 
 
@@ -90,6 +91,18 @@ def normalize(data):
     for name in result['services']:
         if not UNIT.fullmatch(name):
             raise SettingsError(f'Invalid systemd service: {name}')
+    raw_labels = data.get('service_labels', {})
+    if not isinstance(raw_labels, dict):
+        raise SettingsError('Service display names must be a table.')
+    labels = {}
+    for name, value in raw_labels.items():
+        if not isinstance(name, str) or not UNIT.fullmatch(name):
+            raise SettingsError(f'Invalid systemd service: {name}')
+        label = config_text(value, 'Display name', SERVICE_LABEL_LIMIT)
+        if name in result['services'] and label and label != name:
+            labels[name] = label
+    if labels:
+        result['service_labels'] = labels
     result['containers'] = [container_id(value) for value in strings(data.get('containers', []), 'containers')]
 
     apps = data.get('applications', [])
@@ -166,6 +179,9 @@ def serialize(data):
     lines.extend(f'{name} = {toml_string(data[name])}' for name in ('provider', 'role', 'location'))
     lines.append(f'compact = {str(data["compact"]).lower()}')
     lines.extend(f'{name} = {toml_string(data[name])}' for name in ('services', 'containers'))
+    if labels := data.get('service_labels'):
+        lines.append('\n[service_labels]')
+        lines.extend(f'{toml_string(name)} = {toml_string(label)}' for name, label in sorted(labels.items()))
     for app in data['applications']:
         lines.append('\n[[applications]]')
         lines.extend(f'{name} = {toml_string(app[name])}' for name in ('name', 'members', 'primary', 'check_url'))

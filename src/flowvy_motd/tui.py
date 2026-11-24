@@ -14,7 +14,7 @@ import textwrap
 from typing import TYPE_CHECKING
 
 from .dashboard import COLORS, RESET, STATUS, char_width, fit
-from .settings import SettingsError, config_text, probe_target
+from .settings import SERVICE_LABEL_LIMIT, SettingsError, config_text, probe_target
 
 if TYPE_CHECKING:
     from .inventory import Component
@@ -612,10 +612,11 @@ def confirm_uninstall(paths: Iterable[str] = ()) -> bool | None:
 
 
 class _Selection:
-    def __init__(self, items, selected):
+    def __init__(self, items, selected, labels=None):
         self.items = sorted(items, key=lambda item: (item.source, not bool(item.group),
                                                        item.group.casefold(), item.name.casefold()))
         self.selected = list(dict.fromkeys(selected))
+        self.labels = labels
         self.query = ""
 
     def toggle(self, identity):
@@ -628,9 +629,9 @@ class _Selection:
         words = query.casefold().split()
         return [item for item in self.items if all(word in self._searchable(item) for word in words)]
 
-    @staticmethod
-    def _searchable(item):
-        return " ".join((item.id, item.name, item.description, item.group, item.search_text)).casefold()
+    def _searchable(self, item):
+        label = (self.labels or {}).get(item.name, "")
+        return " ".join((item.id, item.name, item.description, item.group, item.search_text, label)).casefold()
 
     def empty(self, noun, query):
         if self.items and query.strip():
@@ -638,8 +639,42 @@ class _Selection:
         return f"No {noun} found."
 
 
-def _picker(screen, items, selected, title, noun):
-    controller = _Selection(items, selected)
+def _rename_service(screen, item, labels):
+    title = "Rename service"
+    name = item.name
+    current = labels.get(name, "")
+    if screen is None:
+        value = _plain_input(f"{title} › {name}", "Display name", current)
+        if value is None:
+            return
+    else:
+        editor = _InlineField(current, SERVICE_LABEL_LIMIT)
+        while True:
+            height, width = screen.size()
+            layout = _layout(height, width, True, _EDIT_KEYS)
+            field = _field_row("Display name", editor.value, layout.content_width + 3,
+                               editor=editor, full_width=True)
+            screen.paint(title, name, [(field, "field")], 0, _EDIT_KEYS)
+            key = screen.key()
+            if key == "\x1b":
+                return
+            if key in _ENTER:
+                value = editor.value
+                break
+            editor.key(key)
+    try:
+        label = config_text(value, "Display name", SERVICE_LABEL_LIMIT)
+    except SettingsError as error:
+        _show(screen, "Invalid display name", str(error))
+        return
+    if label and label != name:
+        labels[name] = label
+    else:
+        labels.pop(name, None)
+
+
+def _picker(screen, items, selected, title, noun, *, labels=None):
+    controller = _Selection(items, selected, labels)
     if screen is None:
         return _plain_picker(controller, title, noun)
 
@@ -649,7 +684,10 @@ def _picker(screen, items, selected, title, noun):
         query = editor.value if editor else controller.query
         results = controller.results(query)
         height, width = screen.size()
+        can_rename = editor is None and labels is not None and results and results[index].id in controller.selected
         shortcuts = _EDIT_KEYS if editor is not None else _PICKER_KEYS
+        if can_rename:
+            shortcuts = (*_PICKER_KEYS[:-2], ("R", "Rename"), *_PICKER_KEYS[-2:])
         layout = _layout(height, width, True, shortcuts)
         rows = [(_field_row("Filter", query, layout.content_width + 3, editor=editor,
                             placeholder="Search by name", label_width=11, full_width=True), "field")]
@@ -658,7 +696,7 @@ def _picker(screen, items, selected, title, noun):
                 rows.append((_Entry(noun.removesuffix("s").capitalize(), "Status"), "columns"))
         pinned = len(rows)
         current = 0 if editor is not None and editor.modified else index
-        entries, indexes = _picker_rows(results, controller.selected, detail_index=current)
+        entries, indexes = _picker_rows(results, controller.selected, detail_index=current, labels=labels)
         rows.extend(entries or [(controller.empty(noun, query), "muted")])
         status = f"{len(controller.selected)} selected  ·  {len(results)} shown"
         focus = 0 if editor is not None else indexes[index] + pinned if indexes else len(rows) - 1
@@ -681,13 +719,21 @@ def _picker(screen, items, selected, title, noun):
             return controller.selected
         elif key == "/":
             editor = _InlineField(controller.query)
+        elif can_rename and key in ("r", "R"):
+            item = results[index]
+            _rename_service(screen, item, labels)
+            results = controller.results(controller.query)
+            if item not in results:
+                controller.query = ""
+                results = controller.results("")
+            index = results.index(item)
         elif results and key == " ":
             controller.toggle(results[index].id)
         elif results:
             index = _navigate(key, index, len(results))
 
 
-def _picker_rows(results, selected, *, detail_index=-1) -> tuple[list[Row], list[int]]:
+def _picker_rows(results, selected, *, detail_index=-1, labels=None) -> tuple[list[Row], list[int]]:
     rows = []
     indexes = []
     previous_group = None
@@ -712,8 +758,11 @@ def _picker_rows(results, selected, *, detail_index=-1) -> tuple[list[Row], list
             context = ""
         tone = STATUS.get(item.state, ("muted", ""))[0]
         rows.append((_Entry(f"[{checked}] {name}", status, tone, context), "component"))
-        if index == detail_index and item.description and item.description != item.name:
-            rows.append((item.description, "detail"))
+        if index == detail_index:
+            label = (labels or {}).get(item.name)
+            detail = f"Display name: {label}" if label else item.description
+            if detail and detail != item.name:
+                rows.append((detail, "detail"))
     return rows, indexes
 
 
@@ -725,8 +774,13 @@ def _plain_picker(controller, title, noun):
         for index, component in enumerate(results):
             selected = "x" if component.id in controller.selected else " "
             metadata = f"  ·  {component.group}" if component.group else ""
-            options.append((str(index), f"[{selected}] {component.name}{metadata}"))
-        options.extend([("filter", "Edit filter"), ("continue", "Continue with selection")])
+            label = (controller.labels or {}).get(component.name)
+            suffix = f"  ·  Display name: {label}" if label else ""
+            options.append((str(index), f"[{selected}] {component.name}{metadata}{suffix}"))
+        options.append(("filter", "Edit filter"))
+        if controller.labels is not None and controller.selected:
+            options.append(("rename", "Rename a selected service"))
+        options.append(("continue", "Continue with selection"))
         count = f"{len(controller.selected)} selected  ·  {len(results)} shown"
         field = _field_row("Filter", controller.query, width, placeholder="Search by name")
         empty = f"\n{controller.empty(noun, controller.query)}" if not results else ""
@@ -739,6 +793,11 @@ def _plain_picker(controller, title, noun):
             value = _plain_input(title, "Filter", controller.query)
             if value is not None:
                 controller.query = _text(value).strip()
+        elif choice == "rename":
+            by_id = {item.id: item for item in controller.items if item.id in controller.selected}
+            identity = _plain_menu([(item.id, item.name) for item in by_id.values()], "Rename service")
+            if identity is not None:
+                _rename_service(None, by_id[identity], controller.labels)
         else:
             controller.toggle(results[int(choice)].id)
 
@@ -779,12 +838,21 @@ def _select_standalone(screen, draft, items, field):
     selected = [identity for identity in current if identity not in grouped]
     available = _with_missing([item for item in items if item.source == source and item.id not in grouped], selected)
     title = "Select containers" if containers else "Select standalone services"
-    result = _picker(screen, available, selected, title, field)
-    if result is not None and result != selected:
+    labels = None if containers else draft.get("service_labels", {}).copy()
+    result = _picker(screen, available, selected, title, field, labels=labels)
+    if result is None:
+        return
+    if result != selected:
         keep = grouped | set(result)
         preserved = [value for identity, value in zip(current, draft.get(field, [])) if identity in keep]
         added = [identity for identity in result if identity not in current]
         draft[field] = preserved + (added if containers else [identity.removeprefix("unit:") for identity in added])
+    if labels is not None:
+        kept_labels = {name: labels[name] for name in draft.get("services", []) if name in labels}
+        if kept_labels:
+            draft["service_labels"] = kept_labels
+        else:
+            draft.pop("service_labels", None)
 
 
 def _keep_ungrouped(draft, members):
