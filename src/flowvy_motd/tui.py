@@ -603,7 +603,7 @@ def confirm_uninstall(paths: Iterable[str] = ()) -> bool | None:
             ("cancel", "Cancel"),
             ("remove", "Remove settings and uninstall"),
             ("keep", "Keep settings and uninstall"),
-        ], "Confirm uninstall", "System packages and OS login settings are kept.")
+        ], "Confirm uninstall", "Restores Debian MOTD rules changed by Flowvy.")
         if choice in ("remove", "keep"):
             return choice == "keep"
         return None

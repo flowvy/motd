@@ -8,6 +8,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import stat
 import subprocess
@@ -20,6 +21,7 @@ import zipfile
 
 BIN = Path("/usr/local/bin/flowvy-motd")
 HOOK = Path("/etc/profile.d/flowvy-motd.sh")
+SSHD_PAM = Path("/etc/pam.d/sshd")
 CONFIG = Path("/etc/flowvy-motd/config.toml")
 SYSTEMD_DIR = Path("/etc/systemd/system")
 SYSTEMD_RUNNING = Path("/run/systemd/system")
@@ -47,6 +49,11 @@ _RELEASE_API = "https://api.github.com/repos/flowvy/motd/releases/latest"
 _VERSION = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 _SHEBANG = b"#!/usr/bin/python3\n"
 _MAX_BUNDLE_BYTES = 4 * 1024 * 1024
+_STOCK_PAM_MOTD = re.compile(
+    rb"[ \t]*session[ \t]+optional[ \t]+pam_motd\.so[ \t]+"
+    rb"(?:motd=/run/motd\.dynamic|noupdate)[ \t]*"
+)
+_PAM_MOTD_OVERRIDE = b" motd=/dev/null noupdate # Flowvy MOTD"
 _DOCKER_CACHE_PREFIX = b'{"format":"flowvy-motd-docker-v1","statuses":'
 _DOCKER_CACHE_TTL = 60
 _DOCKER_SERVICE = "flowvy-motd-docker.service"
@@ -126,15 +133,29 @@ def _serialized():
         os.close(fd)
 
 
-def _atomic_write(path, data, mode):
+def _atomic_write(path, data, mode, *, preserve=None):
     _trusted_directory(path.parent)
     with tempfile.NamedTemporaryFile(prefix=".flowvy-motd-", dir=path.parent, delete=False) as staged:
         staging_path = Path(staged.name)
         try:
             staged.write(data)
             staged.flush()
+            if preserve is not None:
+                staged_info = os.fstat(staged.fileno())
+                if (staged_info.st_uid, staged_info.st_gid) != (preserve.st_uid, preserve.st_gid):
+                    os.fchown(staged.fileno(), preserve.st_uid, preserve.st_gid)
             os.fchmod(staged.fileno(), mode)
+            if preserve is not None:
+                for attribute in os.listxattr(path, follow_symlinks=False):
+                    value = os.getxattr(path, attribute, follow_symlinks=False)
+                    os.setxattr(staged.fileno(), attribute, value)
             os.fsync(staged.fileno())
+            if preserve is not None:
+                current = path.lstat()
+                if (current.st_dev, current.st_ino, current.st_ctime_ns) != (
+                    preserve.st_dev, preserve.st_ino, preserve.st_ctime_ns
+                ):
+                    raise ValueError(f"File changed while preparing an update: {path}")
             os.replace(staging_path, path)
         finally:
             staging_path.unlink(missing_ok=True)
@@ -244,6 +265,50 @@ def _hook_status():
 def hook_status():
     """Return whether this release's own integration is present."""
     return _hook_status()
+
+
+def _pam_motd_change(enabled):
+    if enabled:
+        try:
+            release = platform.freedesktop_os_release()
+        except OSError:
+            return None
+        if (release.get("ID"), release.get("VERSION_ID")) != ("debian", "13"):
+            return None
+
+    info = _path_stat(SSHD_PAM)
+    if info is None:
+        return None
+    try:
+        _trusted_directory(SSHD_PAM.parent)
+        if not _safe_file(info) or info.st_nlink != 1:
+            raise ValueError(f"Refusing to edit an unsafe SSH PAM file: {SSHD_PAM}")
+    except ValueError:
+        if enabled:
+            raise
+        return None
+
+    original = SSHD_PAM.read_bytes()
+    lines = []
+    continued = False
+    for line in original.splitlines(keepends=True):
+        rule = line.rstrip(b"\r\n")
+        ending = line[len(rule):]
+        stock = rule.removesuffix(_PAM_MOTD_OVERRIDE)
+        if not continued and _STOCK_PAM_MOTD.fullmatch(stock):
+            # pam_motd uses the last motd= option. Keep the PAM stack intact.
+            lines.append(stock + (_PAM_MOTD_OVERRIDE if enabled else b"") + ending)
+        else:
+            lines.append(line)
+        continued = rule.partition(b"#")[0].rstrip(b" \t").endswith(b"\\")
+    updated = b"".join(lines)
+    return (info, updated) if updated != original else None
+
+
+def _apply_pam_motd_change(change):
+    if change is not None:
+        info, updated = change
+        _atomic_write(SSHD_PAM, updated, stat.S_IMODE(info.st_mode), preserve=info)
 
 
 def _systemctl(*arguments):
@@ -369,10 +434,20 @@ def set_hook(enabled):
         if enabled:
             if not _owned_binary():
                 raise ValueError("Install Flowvy MOTD before enabling the SSH greeting")
+            pam_change = _pam_motd_change(True)
             _enable_docker_collector()
-            if status != "enabled":
-                _atomic_write(HOOK, HOOK_CONTENT, 0o644)
+            try:
+                if status == "disabled":
+                    _atomic_write(HOOK, HOOK_CONTENT, 0o644)
+                _apply_pam_motd_change(pam_change)
+            except (OSError, ValueError):
+                if status == "disabled":
+                    if _hook_status() == "enabled":
+                        HOOK.unlink()
+                    _disable_docker_collector()
+                raise
         else:
+            _apply_pam_motd_change(_pam_motd_change(False))
             _disable_docker_collector()
             if status == "enabled":
                 HOOK.unlink()
@@ -455,6 +530,7 @@ def uninstall(keep_config):
     """Remove managed files only. Return paths preserved as ownership conflicts."""
     preserved = []
     with _serialized():
+        _apply_pam_motd_change(_pam_motd_change(False))
         _disable_docker_collector()
         status = _hook_status()
         if status == "enabled":

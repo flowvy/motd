@@ -176,8 +176,10 @@ def menu():
                     tui.show_text('Existing SSH hook', f'Existing file: {lifecycle.HOOK}\nFlowvy will preserve this file.')
                 else:
                     choice = 'disable' if hook == 'enabled' else 'enable'
+                    subtitle = ('Hides the system MOTD for all SSH users on Debian 13.' if choice == 'enable'
+                                else 'Restores Debian MOTD rules changed by Flowvy.')
                     decision = tui.menu([('cancel', 'Cancel'), (choice, integration)],
-                                        title='SSH greeting', subtitle='Applies to interactive Bash SSH logins.')
+                                        title='SSH greeting', subtitle=subtitle)
                     if decision == choice:
                         tui.show_text('SSH greeting', admin_action([choice]))
             elif action == 'update' and update_menu():

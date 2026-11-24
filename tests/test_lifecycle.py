@@ -10,6 +10,14 @@ import zipfile
 from flowvy_motd import lifecycle
 
 
+DEBIAN_PAM = (
+    b"@include common-auth\n"
+    b"session    optional     pam_motd.so  motd=/run/motd.dynamic\n"
+    b"session    optional     pam_motd.so noupdate\n"
+    b"@include common-session\n"
+)
+
+
 class LifecycleTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -22,14 +30,19 @@ class LifecycleTest(unittest.TestCase):
         self.bin = base / "flowvy-motd"
         self.hook = profile / "flowvy-motd.sh"
         self.config = self.root / "flowvy-motd" / "config.toml"
+        self.sshd_pam = self.root / "sshd"
         self.systemd = self.root / "systemd"
         self.systemd.mkdir()
         self.systemd_running = self.root / "systemd-running"
         patcher = patch.multiple(lifecycle, BIN=self.bin, HOOK=self.hook, CONFIG=self.config,
                                  SYSTEMD_DIR=self.systemd, SYSTEMD_RUNNING=self.systemd_running,
-                                 DOCKER_CACHE=self.root / "run" / "docker-status.json", create=True)
+                                 DOCKER_CACHE=self.root / "run" / "docker-status.json",
+                                 SSHD_PAM=self.sshd_pam, create=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+        platform = patch("platform.freedesktop_os_release", return_value={"ID": "debian", "VERSION_ID": "13"})
+        platform.start()
+        self.addCleanup(platform.stop)
 
     def bundle(self, version, *, name="candidate.pyz"):
         artifact = self.root / name
@@ -92,6 +105,100 @@ class LifecycleTest(unittest.TestCase):
             systemctl.assert_any_call("stop", "flowvy-motd-docker.service")
         self.assertEqual(list(self.systemd.iterdir()), [])
         self.assertFalse(self.hook.exists())
+
+    def test_enable_hides_both_stock_debian_motd_rules_and_disable_restores_them(self):
+        lifecycle.install_from(self.bundle("0.1.0"))
+        self.sshd_pam.write_bytes(DEBIAN_PAM)
+        self.sshd_pam.chmod(0o640)
+
+        lifecycle.set_hook(True)
+        hidden = self.sshd_pam.read_bytes()
+        self.assertEqual(hidden.count(b"motd=/dev/null"), 2)
+        self.assertEqual(hidden.count(b"\nsession"), 2)
+        self.assertEqual(self.sshd_pam.stat().st_mode & 0o777, 0o640)
+        inode = self.sshd_pam.stat().st_ino
+        lifecycle.set_hook(True)
+        self.assertEqual(self.sshd_pam.stat().st_ino, inode)
+
+        lifecycle.set_hook(False)
+        self.assertEqual(self.sshd_pam.read_bytes(), DEBIAN_PAM)
+
+    def test_uninstall_restores_only_its_own_debian_motd_rules(self):
+        lifecycle.install_from(self.bundle("0.1.0"))
+        previous = DEBIAN_PAM.replace(b"session    optional     pam_motd.so noupdate",
+                                      b"# session    optional     pam_motd.so noupdate")
+        custom = b"session optional pam_motd.so motd=/etc/ops-notice\n"
+        self.sshd_pam.write_bytes(previous + custom)
+        lifecycle.set_hook(True)
+        self.assertNotEqual(self.sshd_pam.read_bytes(), previous + custom)
+        self.assertTrue(self.sshd_pam.read_bytes().endswith(custom))
+        with self.sshd_pam.open("ab") as current:
+            current.write(b"# A later administrator edit\n")
+
+        lifecycle.uninstall(False)
+        self.assertEqual(self.sshd_pam.read_bytes(), previous + custom + b"# A later administrator edit\n")
+
+    def test_enable_applies_pam_change_to_existing_flowvy_hook(self):
+        lifecycle.install_from(self.bundle("0.1.0"))
+        self.hook.write_bytes(lifecycle.HOOK_CONTENT)
+        self.sshd_pam.write_bytes(DEBIAN_PAM)
+
+        lifecycle.set_hook(True)
+
+        self.assertEqual(self.sshd_pam.read_bytes().count(b"motd=/dev/null"), 2)
+        self.assertEqual(lifecycle.hook_status(), "enabled")
+
+    def test_enable_refuses_unsafe_debian_pam_file_before_enabling_greeting(self):
+        lifecycle.install_from(self.bundle("0.1.0"))
+        target = self.root / "elsewhere"
+        target.write_bytes(DEBIAN_PAM)
+        self.sshd_pam.symlink_to(target)
+
+        with self.assertRaises(ValueError):
+            lifecycle.set_hook(True)
+
+        self.assertEqual(target.read_bytes(), DEBIAN_PAM)
+        self.assertFalse(self.hook.exists())
+
+    def test_enable_leaves_non_debian_pam_file_alone(self):
+        lifecycle.install_from(self.bundle("0.1.0"))
+        self.sshd_pam.write_bytes(DEBIAN_PAM)
+
+        with patch("platform.freedesktop_os_release", return_value={"ID": "ubuntu", "VERSION_ID": "24.04"}):
+            lifecycle.set_hook(True)
+
+        self.assertEqual(self.sshd_pam.read_bytes(), DEBIAN_PAM)
+        self.assertEqual(lifecycle.hook_status(), "enabled")
+
+    def test_enable_does_not_edit_a_motd_rule_inside_a_continuation(self):
+        lifecycle.install_from(self.bundle("0.1.0"))
+        continued = DEBIAN_PAM.replace(b"@include common-auth\n",
+                                      b"session optional pam_exec.so /usr/bin/true \\\n")
+        self.sshd_pam.write_bytes(continued)
+
+        lifecycle.set_hook(True)
+
+        self.assertIn(b"pam_motd.so  motd=/run/motd.dynamic\n", self.sshd_pam.read_bytes())
+        self.assertEqual(self.sshd_pam.read_bytes().count(b"motd=/dev/null"), 1)
+
+    def test_failed_pam_write_rolls_back_new_greeting(self):
+        lifecycle.install_from(self.bundle("0.1.0"))
+        self.systemd_running.mkdir()
+        self.sshd_pam.write_bytes(DEBIAN_PAM)
+        write = lifecycle._atomic_write
+
+        def fail_pam_write(path, *args, **kwargs):
+            if path == self.sshd_pam:
+                raise PermissionError("PAM config is read-only")
+            write(path, *args, **kwargs)
+
+        with patch.object(lifecycle, "_systemctl"), patch.object(lifecycle, "_atomic_write", fail_pam_write):
+            with self.assertRaises(PermissionError):
+                lifecycle.set_hook(True)
+
+        self.assertFalse(self.hook.exists())
+        self.assertEqual(list(self.systemd.iterdir()), [])
+        self.assertEqual(self.sshd_pam.read_bytes(), DEBIAN_PAM)
 
     def test_enable_preserves_foreign_collector_unit(self):
         self.systemd_running.mkdir()

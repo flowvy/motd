@@ -5,12 +5,14 @@ A terminal dashboard for interactive Bash SSH sessions on Debian 13. It shows ho
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/flowvy/motd/v0.1.11/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/flowvy/motd/v0.1.12/install.sh | sh
 ```
 
 The installer requires Python 3.11 or newer. It downloads the latest stable GitHub release and checks its SHA-256 checksum before installing the executable. It uses `sudo` when run by a regular account, or installs directly when run as root. The SSH greeting is initially off. CPU usage is sampled from Linux kernel counters. Docker and NetBird are optional.
 
 Run `flowvy-motd` to open the English menu. Select **Configure appearance and services**, preview your choices, and then select **Enable SSH greeting**. The greeting applies to interactive Bash SSH logins. The menu also opens the dashboard on demand, checks for releases, displays diagnostics, and handles removal.
+
+On Debian 13, enabling the greeting silences the stock SSH MOTD for all users. Flowvy adds reversible options to the stock `pam_motd` rules in `/etc/pam.d/sshd`. New SSH sessions pick up the change immediately.
 
 Open **Host details** to edit the provider, server role, and location. Type in the focused field, use **Tab** or **Shift+Tab** to move, and press **Enter** to keep the edits in the draft or **Esc** to discard them.
 
@@ -28,7 +30,7 @@ When the SSH greeting is enabled on a systemd host, a timer collects the selecte
 
 Use **Check for updates** to see the installed and available versions. Confirming the update replaces the executable after verification and retains your settings. Use **Disable SSH greeting** to turn off automatic display while keeping the dashboard available.
 
-If you upgraded from a version that predates the Docker status timer and already had the SSH greeting enabled, run `sudo flowvy-motd --admin enable` once after updating to provision the timer.
+After upgrading from an older release with the SSH greeting already enabled, run `sudo flowvy-motd --admin enable` once to apply the current integration, including the Docker status timer and Debian MOTD suppression.
 
 Use **Uninstall Flowvy MOTD** to review the file paths and decide whether to keep settings. Flowvy manages these paths:
 
@@ -38,7 +40,7 @@ Use **Uninstall Flowvy MOTD** to review the file paths and decide whether to kee
 - `/etc/systemd/system/flowvy-motd-docker.service` and `flowvy-motd-docker.timer` for the optional Docker status collector.
 - `/run/flowvy-motd/docker-status.json` for the temporary snapshot.
 
-Uninstall checks file ownership and preserves a foreign or edited hook, which it reports by path. The OS login configuration, PAM, SSH daemon, `.hushlogin`, and installed dependencies are outside the installer's file list. You can review the local configuration and integration via **Diagnostics**.
+Disabling the greeting or uninstalling restores the original options on any SSH PAM rule still managed by Flowvy. Existing comments, custom PAM rules, and `.hushlogin` settings stay as configured by the administrator. Uninstall checks file ownership and reports foreign or edited hooks by path. You can review the local configuration and integration via **Diagnostics**.
 
 ## Remove the previous script installation
 
