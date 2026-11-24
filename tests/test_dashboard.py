@@ -58,18 +58,18 @@ class DashboardTests(unittest.TestCase):
         text = render_dashboard({}, metrics, {}, {}, {}, width=80, color=False)
         rows = dict(line.split('│', 1) for line in text.splitlines() if '│' in line)
         self.assertEqual({label.strip(): value for label, value in rows.items()}, {
-            'RAM': '  ⎯⎯⎯---------  1.0 GiB / 4.0 GiB',
-            'Swap': '  ------------  0 MiB / 2.0 GiB',
-            'Disk': '  ⎯⎯⎯⎯⎯⎯------  2.0 GiB / 4.0 GiB',
+            'RAM': '  −−−·········  1.0 GiB / 4.0 GiB',
+            'Swap': '  ············  0 MiB / 2.0 GiB',
+            'Disk': '  −−−−−−······  2.0 GiB / 4.0 GiB',
         })
 
-    def test_colored_resource_bar_uses_the_same_line_for_usage_and_track(self):
+    def test_colored_resource_bar_uses_bold_ticks_for_usage(self):
         gib = 1024 ** 3
         text = render_dashboard({}, {'memory': (gib, 4 * gib)}, {}, {}, {})
         ram = next(line for line in text.splitlines() if 'RAM' in line)
         self.assertEqual(
             ram.split('│', 1)[1],
-            f'  {COLORS["ok"]}⎯⎯⎯{RESET}{COLORS["muted"]}⎯⎯⎯⎯⎯⎯⎯⎯⎯{RESET}  1.0 GiB / 4.0 GiB',
+            f'  {COLORS["accent"]}−−−{RESET}{COLORS["muted"]}−−−−−−−−−{RESET}  1.0 GiB / 4.0 GiB',
         )
 
     def test_disabled_swap_preserves_the_resource_value_column(self):

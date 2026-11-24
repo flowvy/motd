@@ -147,10 +147,9 @@ def render_dashboard(config, metrics, network, components, probes, *, width=80, 
         scale = ' ' * scale_width
         if total:
             length = min(scale_width, max(0, round(scale_width * used / total)))
-            # The line extension sits on the text's midline in Termius Pro.
-            stroke = '⎯'
-            track = stroke if color else '-'
-            scale = tint(stroke * length, 'ok') + tint(track * (scale_width - length), 'muted')
+            stroke = '−'
+            track = stroke if color else '·'
+            scale = tint(stroke * length, 'accent') + tint(track * (scale_width - length), 'muted')
         lines.append(f"{tint(label.ljust(key_width), 'accent')}{separator} {scale}  {figures}")
 
     if not compact:
